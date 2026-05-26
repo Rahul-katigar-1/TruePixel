@@ -1,0 +1,44 @@
+# TruePixel — pinned dependencies
+# Python 3.11.x required (3.12+ breaks mediapipe and tensorflow)
+# Last verified: June 2025
+# DO NOT upgrade any version without testing the full stack first.
+
+# Core computer vision
+opencv-python==4.8.1.78
+
+# Face mesh — PINNED: 0.10.9 is last stable version with mp.solutions API on Windows
+# Do not upgrade. Versions above 0.10.21 removed mp.solutions.face_mesh.
+mediapipe==0.10.9
+
+# ML framework — TF 2.13 is last version where DeepFace works without tf-keras hacks
+# and protobuf 3.x is compatible
+tensorflow==2.13.1
+tensorflow-intel==2.13.1
+
+# DeepFace — 0.0.79 tested with TF 2.13 and numpy 1.24.x
+deepface==0.0.79
+
+# numpy pinned to 1.24.3 — tensorflow 2.13.1 metadata strictly requires <=1.24.3
+# 1.24.4 causes pip check to fail. Do not upgrade.
+numpy==1.24.3
+
+# Signal processing for rPPG heartbeat detection
+scipy==1.11.4
+
+# UI and visualisation
+matplotlib==3.7.5
+Pillow==10.2.0
+
+# protobuf — 3.20.3 is compatible with tensorflow 2.13 AND mediapipe 0.10.9
+protobuf==3.20.3
+
+# Required by deepface
+retina-face==0.0.17
+fire==0.5.0
+gdown==4.7.3
+tqdm==4.66.4
+pandas==2.0.3
+requests==2.31.0
+
+# Packaging — for building the .exe
+pyinstaller==6.3.0

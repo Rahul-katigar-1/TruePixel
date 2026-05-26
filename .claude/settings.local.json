@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version)",
+      "PowerShell(py --version)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command python3 -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command py -ErrorAction SilentlyContinue)",
+      "PowerShell(py tests\\\\test_day1.py)"
+    ]
+  }
+}

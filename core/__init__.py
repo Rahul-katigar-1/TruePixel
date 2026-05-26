@@ -1,0 +1,1 @@
+# TruePixel core detection modules
