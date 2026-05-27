@@ -40,25 +40,43 @@ class FaceMatcher:
             self._deepface = None
 
     def _load_enrolled(self):
-        """Load all saved embeddings from disk into memory."""
+        """
+        Load all saved embeddings from disk into memory.
+        Supports two formats for backward compatibility:
+          - `embeddings.npy` (new, 2D matrix shape (N, 128)) — multi-pose
+          - `embedding.npy`  (legacy, 1D vector shape (128,)) — averaged frontal
+        """
         base = config.ENROLLED_FACES_DIR
         if not os.path.exists(base):
             return
         for name in os.listdir(base):
-            emb_path = os.path.join(base, name, "embedding.npy")
-            if os.path.exists(emb_path):
-                self._enrolled[name] = np.load(emb_path)
-                print(f"[FaceMatcher] Loaded enrolled face: {name}")
+            multi_path  = os.path.join(base, name, "embeddings.npy")
+            legacy_path = os.path.join(base, name, "embedding.npy")
+            if os.path.exists(multi_path):
+                self._enrolled[name] = np.load(multi_path)
+                shape = self._enrolled[name].shape
+                print(f"[FaceMatcher] Loaded enrolled face: {name} "
+                      f"(multi-pose, {shape[0]} embeddings)")
+            elif os.path.exists(legacy_path):
+                self._enrolled[name] = np.load(legacy_path)
+                print(f"[FaceMatcher] Loaded enrolled face: {name} (legacy single embedding)")
 
     def enroll(self, name):
         """
-        Enroll a new person by capturing 3 webcam photos.
+        Enroll a new person by capturing 3 pose-varied webcam photos.
+
+        Industry-standard multi-pose enrollment: frontal + slight left + slight right.
+        Each photo's embedding is stored separately (NOT averaged). At match time
+        the maximum cosine similarity across all 3 embeddings is used — so the
+        user is recognised at any of the enrolled angles, not only when facing
+        the camera dead-on. This dramatically improves real-world recognition
+        when the user naturally turns their head during video calls.
 
         Args:
             name (str): the person's name, used as folder name
 
         Returns:
-            True if enrollment succeeded, False if it failed
+            True if enrollment succeeded with at least 1 embedding, False otherwise.
         """
         if self._deepface is None:
             print("[FaceMatcher] ERROR: DeepFace not loaded. Cannot enroll.")
@@ -72,20 +90,34 @@ class FaceMatcher:
             print("[FaceMatcher] ERROR: Cannot open camera for enrollment.")
             return False
 
-        print(f"\n[Enrollment] Starting enrollment for: {name}")
-        print("[Enrollment] Look at the camera. Keep your face still.")
+        # Pose script: (label, on-screen instruction text)
+        # Slight angles only (~15°) — too much rotation and Facenet's embedding
+        # drifts so far that the multi-pose advantage is lost.
+        poses = [
+            ("frontal", "POSE 1/3: Look STRAIGHT at the camera"),
+            ("left",    "POSE 2/3: Turn head SLIGHTLY LEFT (~15 deg)"),
+            ("right",   "POSE 3/3: Turn head SLIGHTLY RIGHT (~15 deg)"),
+        ]
+
+        print(f"\n[Enrollment] Starting multi-pose enrollment for: {name}")
+        print("[Enrollment] You'll be asked to turn your head between photos.")
+        print("[Enrollment] Keep good lighting on your FACE (not behind you).")
         embeddings = []
 
-        for i in range(config.ENROLLMENT_PHOTO_COUNT):
-            print(f"\n[Enrollment] Photo {i+1} of {config.ENROLLMENT_PHOTO_COUNT} — get ready...")
+        for i, (pose_label, instruction) in enumerate(poses):
+            print(f"\n[Enrollment] {instruction} — get ready...")
             for countdown in range(config.ENROLLMENT_COUNTDOWN_SECONDS, 0, -1):
                 print(f"  {countdown}...")
-                # Show live preview during countdown
+                # Show live preview with instruction overlay during countdown
                 for _ in range(10):
                     ret, frame = cap.read()
                     if ret:
-                        cv2.putText(frame, f"Photo {i+1}/{config.ENROLLMENT_PHOTO_COUNT} in {countdown}s",
-                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 136), 2)
+                        cv2.putText(frame, instruction,
+                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (0, 255, 136), 2)
+                        cv2.putText(frame, f"Capturing in {countdown}s",
+                                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (245, 158, 11), 2)
                         cv2.imshow("TruePixel Enrollment", frame)
                         cv2.waitKey(100)
 
@@ -96,9 +128,9 @@ class FaceMatcher:
                 cv2.destroyAllWindows()
                 return False
 
-            photo_path = os.path.join(save_dir, f"photo_{i+1}.jpg")
+            photo_path = os.path.join(save_dir, f"photo_{pose_label}.jpg")
             cv2.imwrite(photo_path, frame)
-            print(f"[Enrollment] Photo {i+1} captured and saved.")
+            print(f"[Enrollment] {pose_label} photo captured and saved.")
 
             try:
                 result = self._deepface.represent(
@@ -106,9 +138,10 @@ class FaceMatcher:
                 )
                 emb = np.array(result[0]["embedding"])
                 embeddings.append(emb)
-                print(f"[Enrollment] Embedding extracted for photo {i+1}.")
+                print(f"[Enrollment] Embedding extracted for {pose_label} pose.")
             except Exception as e:
-                print(f"[Enrollment] WARNING: Could not extract embedding from photo {i+1}: {e}")
+                print(f"[Enrollment] WARNING: Could not extract embedding from "
+                      f"{pose_label} photo: {e}")
 
         cap.release()
         cv2.destroyAllWindows()
@@ -117,12 +150,21 @@ class FaceMatcher:
             print("[Enrollment] ERROR: No embeddings extracted. Enrollment failed.")
             return False
 
-        # Average all captured embeddings for a more robust baseline
+        # Save the multi-pose embedding matrix (shape: (N, 128))
+        emb_matrix = np.array(embeddings)
+        multi_path = os.path.join(save_dir, "embeddings.npy")
+        np.save(multi_path, emb_matrix)
+
+        # Also save a legacy averaged single embedding for backward compatibility
+        # (allows tools written against the old format to still function)
         mean_embedding = np.mean(embeddings, axis=0)
-        emb_path = os.path.join(save_dir, "embedding.npy")
-        np.save(emb_path, mean_embedding)
-        self._enrolled[name] = mean_embedding
-        print(f"\n[Enrollment] SUCCESS: {name} enrolled. Embedding saved to {emb_path}")
+        legacy_path = os.path.join(save_dir, "embedding.npy")
+        np.save(legacy_path, mean_embedding)
+
+        self._enrolled[name] = emb_matrix
+        print(f"\n[Enrollment] SUCCESS: {name} enrolled with "
+              f"{len(embeddings)} pose embeddings.")
+        print(f"[Enrollment] Saved to {multi_path}")
         return True
 
     def match(self, frame):
@@ -155,17 +197,28 @@ class FaceMatcher:
 
         best_name = "Unknown"
         best_score = 0.0
+        live_norm = float(np.linalg.norm(live_emb))
 
-        for name, enrolled_emb in self._enrolled.items():
-            # Cosine similarity: 1.0 = identical, 0.0 = completely different
-            dot = np.dot(live_emb, enrolled_emb)
-            norm = np.linalg.norm(live_emb) * np.linalg.norm(enrolled_emb)
-            similarity = float(dot / norm) if norm > 0 else 0.0
-            # Normalize to 0-1 range (cosine similarity is -1 to 1)
-            score = (similarity + 1.0) / 2.0
+        for name, enrolled in self._enrolled.items():
+            # Normalize shape: legacy single embedding is 1-D; multi-pose is 2-D.
+            # Treat 1-D as a single-row matrix so the rest of the code is uniform.
+            if enrolled.ndim == 1:
+                ref_matrix = enrolled.reshape(1, -1)
+            else:
+                ref_matrix = enrolled
+
+            # Cosine similarity against EACH stored pose embedding,
+            # then take the MAX — the user is recognised at any enrolled angle.
+            ref_norms = np.linalg.norm(ref_matrix, axis=1)
+            dots      = ref_matrix @ live_emb
+            denom     = ref_norms * live_norm
+            # Guard against zero-norm edge cases
+            sims      = np.where(denom > 0, dots / denom, 0.0)
+            score     = float((sims.max() + 1.0) / 2.0)   # normalize [-1,1] → [0,1]
+
             if score > best_score:
                 best_score = score
-                best_name = name
+                best_name  = name
 
         matched = best_score >= config.FACE_MATCH_THRESHOLD
         return {

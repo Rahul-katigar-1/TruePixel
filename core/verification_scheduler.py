@@ -22,9 +22,10 @@ import threading
 import logging
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Any
 
 import config
+from core.texture_detector import TextureDetector
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,38 @@ class CheckResult:
     ear:                    float = 0.0
     background_correlation: float = 0.0
     replay_suspected:       bool  = False
+    # ── Multi-signal liveness (Improvement 1) ───────────────────────────
+    liveness_score:         float = 0.0   # 0.0 / 0.7 / 1.0
+    liveness_signals_active: int  = 0     # count of non-blink signals that fired
+    ear_variance:           float = 0.0
+    iris_drift:             float = 0.0
+    head_drift:             float = 0.0
+    mouth_var:              float = 0.0
+    # ── LBP texture defence (Improvement 2) ─────────────────────────────
+    lbp_variance:           float = 0.0
+    texture_screen_suspected: bool = False
     alert_reason:           Optional[str] = None
+    # Representative frame from the burst — captured so the dev-feedback UI
+    # can show the developer exactly which image is being labelled. Excluded
+    # from repr/compare because numpy arrays don't compare cleanly and the
+    # repr would dump thousands of pixel values into the logs.
+    last_frame:             Any = field(default=None, repr=False, compare=False)
+
+    def short_failure_reason(self) -> str:
+        """
+        Categorical, user-facing failure reason. Priority: replay > identity
+        > liveness > rPPG > generic-score. Shared by the dashboard status
+        banner and the main alert log to keep the wording consistent.
+        """
+        if self.texture_screen_suspected:
+            return f"Phone screen detected (LBP {self.lbp_variance:.2f})"
+        if self.face_confidence < config.FACE_MATCH_THRESHOLD:
+            return f"Face not recognised ({int(self.face_confidence * 100)}%)"
+        if self.liveness_score < 0.7:
+            return f"Liveness weak ({self.liveness_signals_active}/4 signals)"
+        if self.signal_quality < config.RPPG_NOISE_FLOOR:
+            return f"Heartbeat signal noisy ({self.signal_quality:.2f})"
+        return f"Score low ({self.composite_score:.2f})"
 
 
 class VerificationScheduler:
@@ -70,6 +102,8 @@ class VerificationScheduler:
         self.blink_det     = blink_detector
         self.rppg_det      = rppg_detector
         self.face_matcher  = face_matcher
+        # Layer 2 replay defence (LBP texture, independent of rPPG)
+        self.texture_det   = TextureDetector()
 
         self._check_count  = 0
         self._phase        = SessionPhase.WAITING_FOR_FIRST
@@ -183,9 +217,14 @@ class VerificationScheduler:
         burst_blink_count = 0    # blinks detected DURING this burst (not cumulative)
         ears              = []   # EAR values from frames where a face was found
         rppg              = None # holds last rPPG result — FFT improves as buffer fills
+        last_frame        = None # save the final frame+landmarks for texture analysis
+        last_landmarks    = None
 
         for i, frame in enumerate(frames):
             landmarks, _ = self.face_mesh.process(frame)
+            if landmarks is not None:
+                last_frame = frame
+                last_landmarks = landmarks
 
             # Face match — run on every 5th frame (slow operation)
             if i % 5 == 0:
@@ -245,21 +284,27 @@ class VerificationScheduler:
         # A real user with quality 0.22:
         #   0.80×0.50 + 1.0×0.30 + 0.22×0.20 = 0.400 + 0.300 + 0.044 = 0.744 → PASS ✓
         #
-        # Blink scoring (calibrated for screen-work):
-        #   0 or 1 blinks in 8s  → 0.0  (photo / static deepfake)
-        #   2+ blinks in 8s      → 0.5  (minimal but alive signal)
-        #   5-30/min             → 1.0  (normal screen work)
-        #   >30/min              → 0.5  (unusually rapid — penalise but don't fail)
-        blink_score = (1.0 if 5  <= avg_blink_rate <= 30
-                       else 0.5 if avg_blink_rate >= 2.0
-                       else 0.0)
+        # Multi-signal liveness (Improvement 1) — replaces blink-only scoring.
+        # Real users who don't blink during the 8s burst still get credit if
+        # ANY of (EAR variance, iris drift, head drift, mouth movement) fired.
+        # Pulled from the BlinkDetector which collected the signals per-frame.
+        liveness = self.blink_det.compute_liveness_score()
+        liveness_score          = liveness["score"]
+        liveness_signals_active = liveness["signals_active"]
+
+        # LBP texture defence (Improvement 2 — Layer 2 anti-replay).
+        # Single representative frame is enough (texture is a spatial property,
+        # not temporal). We use the last frame that had a face in it.
+        texture_result = self.texture_det.analyze(last_frame, last_landmarks)
+        lbp_variance           = texture_result["lbp_variance"]
+        texture_screen_suspected = texture_result["is_screen_suspected"]
 
         # Clamp rPPG contribution at noise floor — zero credit below floor
         rppg_contribution = max(0.0, final_signal_quality - config.RPPG_NOISE_FLOOR)
 
         composite = round(
             avg_face_conf     * config.FACE_MATCH_WEIGHT +
-            blink_score       * config.BLINK_WEIGHT      +
+            liveness_score    * config.BLINK_WEIGHT      +
             rppg_contribution * config.HEARTBEAT_WEIGHT,
             4
         )
@@ -267,7 +312,8 @@ class VerificationScheduler:
         passed = composite >= config.COMPOSITE_ALERT_THRESHOLD
         alert_reason = None if passed else (
             f"Score {composite:.4f} below threshold {config.COMPOSITE_ALERT_THRESHOLD} — "
-            f"face={avg_face_conf:.2f} blink={avg_blink_rate:.1f}/min "
+            f"face={avg_face_conf:.2f} liveness={liveness_score:.1f} "
+            f"(sig={liveness_signals_active}) blink={avg_blink_rate:.1f}/min "
             f"rPPG={final_signal_quality:.3f} (effective={rppg_contribution:.3f})"
         )
 
@@ -285,42 +331,57 @@ class VerificationScheduler:
         # it produced 40% FP / 41% FN in office conditions.
         bg_correlation   = last_rppg.get("background_correlation", 0.0)
         spectral_replay  = last_rppg.get("spectral_replay_suspected", False)
-        replay_suspected = (
-            spectral_replay
-            and len(frames) >= 60  # require enough samples for reliable FFT
-        )
+
+        # Empirical decision (May 2026, Rahul's office):
+        # Spectral defence false-positives on ~33% of real-user checks
+        # (random BG noise coincidentally lands in the heartbeat band).
+        # LBP texture defence cleanly separates real face (≥4.85) from phone
+        # replay (≤4.54) in this environment.
+        # → LBP becomes the PRIMARY replay signal; spectral becomes diagnostic.
+        # Spectral and Pearson are still computed and logged for analysis but
+        # no longer drive the verdict.
+        replay_suspected = texture_screen_suspected
 
         if replay_suspected:
             logger.warning(
-                f"Replay attack suspected (spectral peak match). "
-                f"Background patch shares face's heartbeat-band peak — "
-                f"a phone screen is pulsing the scene at the user's pulse rate. "
-                f"Legacy Pearson correlation={bg_correlation:.3f} (diagnostic only)."
+                f"Replay attack suspected — LBP texture too smooth "
+                f"({lbp_variance:.3f} < {config.TEXTURE_LBP_VARIANCE_MIN}). "
+                f"Diagnostic: spectral={spectral_replay}, "
+                f"legacy Pearson corr={bg_correlation:.3f}."
             )
             # A replay attack overrides all other signals — force fail
             passed = False
             alert_reason = (
-                f"Replay attack suspected — background patch shares face's "
-                f"heartbeat-band spectral peak (phone screen detected). "
-                f"Legacy Pearson corr={bg_correlation:.3f}."
+                f"Replay attack suspected — LBP texture too smooth "
+                f"({lbp_variance:.3f} < {config.TEXTURE_LBP_VARIANCE_MIN}). "
+                f"Phone screen detected."
             )
 
         result = CheckResult(
-            check_number           = self._check_count,
-            timestamp              = time.time(),
-            phase                  = self._phase,
-            face_confidence        = avg_face_conf,
-            face_name              = matched_name,
-            blink_rate             = avg_blink_rate,
-            ear                    = avg_ear,
-            signal_quality         = final_signal_quality,
-            heart_rate             = final_heart_rate,
-            composite_score        = composite,
-            passed                 = passed,
-            frames_captured        = len(frames),
-            background_correlation = bg_correlation,
-            replay_suspected       = replay_suspected,
-            alert_reason           = alert_reason,
+            check_number             = self._check_count,
+            timestamp                = time.time(),
+            phase                    = self._phase,
+            face_confidence          = avg_face_conf,
+            face_name                = matched_name,
+            blink_rate               = avg_blink_rate,
+            ear                      = avg_ear,
+            signal_quality           = final_signal_quality,
+            heart_rate               = final_heart_rate,
+            composite_score          = composite,
+            passed                   = passed,
+            frames_captured          = len(frames),
+            background_correlation   = bg_correlation,
+            replay_suspected         = replay_suspected,
+            liveness_score           = liveness_score,
+            liveness_signals_active  = liveness_signals_active,
+            ear_variance             = liveness["ear_variance"],
+            iris_drift               = liveness["iris_drift"],
+            head_drift               = liveness["head_drift"],
+            mouth_var                = liveness["mouth_var"],
+            lbp_variance             = lbp_variance,
+            texture_screen_suspected = texture_screen_suspected,
+            alert_reason             = alert_reason,
+            last_frame               = last_frame,
         )
 
         logger.info(

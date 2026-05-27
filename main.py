@@ -18,9 +18,18 @@ To run:
     python main.py
 """
 
+import sys
 import threading
 import time
 import logging
+
+# Force stdout to UTF-8 so the gate-string symbols (✓ / ✗) print without
+# Windows' default cp1252 codec raising UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass  # older Python or non-TTY stream — fall back silently
 
 from core.logger_setup import setup_logging
 setup_logging()
@@ -70,6 +79,9 @@ def main():
     def on_check_complete(result: CheckResult):
         """Update dashboard with averaged results from the burst."""
         dashboard.show_burst_indicator(False)
+        # Hand the full CheckResult to the dashboard so the dev feedback panel
+        # has every signal value available when the developer clicks Real/Fake.
+        dashboard.notify_check_complete(result)
         dashboard.update_status({
             "face_name":        result.face_name,
             "face_confidence":  result.face_confidence,
@@ -81,31 +93,39 @@ def main():
         })
         status = "PASS" if result.passed else "FAIL"
 
-        # Derive per-gate display from CheckResult fields for at-a-glance log
-        identity_ok = result.face_confidence >= config.FACE_MATCH_THRESHOLD
-        liveness_ok = result.blink_rate     >= 2.0
-        rppg_ok     = result.signal_quality >  config.RPPG_NOISE_FLOOR
+        # Per-gate display: derived from CheckResult fields for at-a-glance log
+        identity_ok    = result.face_confidence >= config.FACE_MATCH_THRESHOLD
+        liveness_ok    = result.liveness_score   >= 0.7
+        rppg_ok        = result.signal_quality   >  config.RPPG_NOISE_FLOOR
+        texture_ok     = not result.texture_screen_suspected
+        replay_clear   = not result.replay_suspected
         gate_str = (
             f"[ID:{'✓' if identity_ok else '✗'}] "
-            f"[Blink:{'✓' if liveness_ok else '✗'}] "
+            f"[Live:{'✓' if liveness_ok else '✗'}({result.liveness_signals_active}/4)] "
             f"[rPPG:{'✓' if rppg_ok else '✗'}] "
-            f"[Replay:{'✗ SUSPECTED' if result.replay_suspected else '✓'}]"
+            f"[Tex:{'✓' if texture_ok else '✗'}] "
+            f"[Replay:{'✓' if replay_clear else '✗ SUSPECTED'}]"
         )
 
-        dashboard.log.add_entry(
+        # Build the per-check summary line ONCE, then send to both the
+        # dashboard event log AND the console logger so we can read values
+        # like `lbp=` directly from terminal output (useful for calibration).
+        summary_line = (
             f"Check #{result.check_number}: {status} | "
             f"score={result.composite_score:.2f} | "
             f"frames={result.frames_captured} | "
+            f"lbp={result.lbp_variance:.5f} | "
             f"bg-corr={result.background_correlation:.3f} {gate_str}"
         )
+        dashboard.log.add_entry(summary_line)
+        logger.info(summary_line)
         if result.passed:
             dashboard.clear_alert()
         logger.info(f"Check #{result.check_number} complete. Passed: {result.passed}")
 
     def on_alert(result: CheckResult):
         """Alert dashboard when check fails."""
-        short_reason = f"Score {result.composite_score:.2f} < {config.COMPOSITE_ALERT_THRESHOLD:.2f}"
-        dashboard.show_alert(short_reason)
+        dashboard.show_alert(result.short_failure_reason())
         dashboard.log.add_entry(f"ALERT: {result.alert_reason}")
         logger.warning(f"ALERT: {result.alert_reason}")
 

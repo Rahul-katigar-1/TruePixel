@@ -73,7 +73,14 @@ class RPPGDetector:
 
     def __init__(self):
         self._buffer_size = config.RPPG_BUFFER_SECONDS * config.RPPG_SAMPLE_RATE
+        # Primary forehead ROI — best skin area when exposed
         self._green_buffer: deque = deque(maxlen=self._buffer_size)
+        # Fallback cheek ROI — used when forehead is occluded by cap/hair/hand.
+        # We always sample both in parallel and pick the buffer with higher
+        # std-dev once both are filled (real pulse → high std; occluded ROI
+        # over a solid hat or hair gives near-flat output → low std).
+        self._cheek_buffer: deque = deque(maxlen=self._buffer_size)
+        self._active_roi: str = "forehead"
 
         # Multi-region face-adjacent background buffers — replay attack defence.
         # See: PPGSecure, Nowara et al. IEEE FG 2017 (we deviate from frame-edge
@@ -111,14 +118,19 @@ class RPPGDetector:
             self._last_status = "No signal"
             return self._result(0.0, 0.0, "No signal")
 
-        # ── Step 1: Extract forehead ROI mean green value ─────────────────
-        green_mean = self._extract_green_mean(frame, landmarks)
+        # ── Step 1: Extract green mean from BOTH ROIs (forehead + cheek) ──
+        # Sample both every frame; ROI selection happens later once buffers fill.
+        forehead_mean = self._extract_green_mean(frame, landmarks)
+        cheek_mean    = self._extract_cheek_green_mean(frame, landmarks)
 
-        if green_mean is None:
+        if forehead_mean is None and cheek_mean is None:
             self._last_status = "No signal"
             return self._result(0.0, 0.0, "No signal")
 
-        self._green_buffer.append(green_mean)
+        if forehead_mean is not None:
+            self._green_buffer.append(forehead_mean)
+        if cheek_mean is not None:
+            self._cheek_buffer.append(cheek_mean)
 
         # Sample 4 face-adjacent background patches in parallel — replay defence
         # (PPGSecure Fix A). Each patch gets its own rolling buffer. We compare
@@ -129,14 +141,25 @@ class RPPGDetector:
                 self._bg_patch_buffers[label] = deque(maxlen=self._buffer_size)
             self._bg_patch_buffers[label].append(value)
 
-        # ── Step 2: Check if buffer has enough data for FFT ───────────────
-        fill_ratio = len(self._green_buffer) / self._buffer_size
-        if fill_ratio < MIN_BUFFER_FILL_RATIO:
+        # ── Step 2: Check if at least one ROI buffer has enough data ─────
+        fill_ratio_forehead = len(self._green_buffer) / self._buffer_size
+        fill_ratio_cheek    = len(self._cheek_buffer) / self._buffer_size
+        if max(fill_ratio_forehead, fill_ratio_cheek) < MIN_BUFFER_FILL_RATIO:
             self._last_status = "Initializing"
             return self._result(0.0, 0.0, "Initializing")
 
-        # ── Step 3: Bandpass filter ───────────────────────────────────────
-        raw = np.array(self._green_buffer, dtype=np.float64)
+        # ── Step 2b: Pick the ROI with the stronger signal ────────────────
+        # Higher std-dev = more dynamic range = more likely to contain a real
+        # pulse (a flat ROI over fabric/hair/skin-tone-of-hand has near-zero
+        # std after detrend). Forehead usually wins when exposed; cheek wins
+        # when the forehead is occluded by a cap or hair.
+        chosen_buffer, chosen_roi = self._pick_active_roi(
+            fill_ratio_forehead, fill_ratio_cheek
+        )
+        self._active_roi = chosen_roi
+
+        # ── Step 3: Bandpass filter on the chosen buffer ──────────────────
+        raw = np.array(chosen_buffer, dtype=np.float64)
 
         # Detrend removes slow drift (e.g. lighting changes, head movement)
         raw = raw - np.mean(raw)
@@ -192,7 +215,8 @@ class RPPGDetector:
 
         logger.debug(
             f"rPPG: BPM={heart_rate:.1f} quality={quality:.3f} "
-            f"fill={fill_ratio:.2f} status={status}"
+            f"roi={chosen_roi} fill_fh={fill_ratio_forehead:.2f} "
+            f"fill_ch={fill_ratio_cheek:.2f} status={status}"
         )
         return self._result(heart_rate, quality, status)
 
@@ -202,13 +226,46 @@ class RPPGDetector:
         Matches BlinkDetector.reset() pattern for consistency.
         """
         self._green_buffer.clear()
+        self._cheek_buffer.clear()
         for buf in self._bg_patch_buffers.values():
             buf.clear()
         self._last_heart_rate  = 0.0
         self._last_quality     = 0.0
         self._last_status      = "Initializing"
         self._last_filtered    = []
+        self._active_roi       = "forehead"
         logger.debug("RPPGDetector reset.")
+
+    def _pick_active_roi(self, fill_forehead: float, fill_cheek: float):
+        """
+        Choose the ROI buffer that carries the stronger pulse signal.
+        Returns (chosen_buffer_deque, "forehead" | "cheek").
+
+        Selection rule:
+          - If only one buffer is filled past MIN_BUFFER_FILL_RATIO, use it.
+          - If both are filled, compare std-dev — higher std wins. A flat
+            ROI over a cap, hair, or palm produces near-zero std after
+            detrend, while exposed skin under a real pulse produces a
+            clearly modulated signal.
+
+        Forehead is preferred on ties / near-ties because it has a larger
+        skin area and tends to be steadier than cheeks during talking.
+        """
+        forehead_ready = fill_forehead >= MIN_BUFFER_FILL_RATIO
+        cheek_ready    = fill_cheek    >= MIN_BUFFER_FILL_RATIO
+
+        if forehead_ready and not cheek_ready:
+            return self._green_buffer, "forehead"
+        if cheek_ready and not forehead_ready:
+            return self._cheek_buffer, "cheek"
+
+        # Both ready — compare std-dev. Add a small bias toward forehead so
+        # we don't flip back and forth on near-identical stds.
+        forehead_std = float(np.std(self._green_buffer))
+        cheek_std    = float(np.std(self._cheek_buffer))
+        if cheek_std > forehead_std * 1.10:   # cheek must be ≥10% stronger
+            return self._cheek_buffer, "cheek"
+        return self._green_buffer, "forehead"
 
     def _bandpass_filter(self, signal_array):
         """
@@ -271,7 +328,13 @@ class RPPGDetector:
         gates the verdict on it (REPLAY_ATTACK_CORRELATION_THRESHOLD = 0.99).
         """
         if face_signal is None:
-            face_signal = list(self._green_buffer)
+            # Use whichever ROI buffer is currently driving the verdict so
+            # the diagnostic correlation is measured against the same signal
+            # the FFT consumed (forehead by default; cheek if fallback active).
+            face_signal = list(
+                self._cheek_buffer if self._active_roi == "cheek"
+                else self._green_buffer
+            )
         min_samples = int(self._buffer_size * 0.75)
         if len(face_signal) < min_samples:
             return 0.0
@@ -323,7 +386,12 @@ class RPPGDetector:
         REPLAY_SPECTRAL_MIN_POWER_RATIO × face_peak_power.
         """
         if face_signal is None:
-            face_signal = list(self._green_buffer)
+            # Use whichever ROI buffer is driving the verdict — see comment
+            # in compute_face_background_correlation() for rationale.
+            face_signal = list(
+                self._cheek_buffer if self._active_roi == "cheek"
+                else self._green_buffer
+            )
         if len(face_signal) < 16:
             return False
 
@@ -548,6 +616,56 @@ class RPPGDetector:
             logger.warning(f"Green channel extraction failed: {e}")
             return None
 
+    def _extract_cheek_green_mean(self, frame, landmarks):
+        """
+        Fallback ROI: average green channel across CHEEK_ROI_SIZE_PX-sized
+        square patches around the left and right cheek landmarks.
+
+        Used when the forehead is occluded (cap, hair, hand). The cheek is
+        well-vascularised skin that doesn't typically share the forehead's
+        occlusion sources. We average both cheeks together to maximise
+        pixel count (≈3200 pixels combined at 40 px patch size) and to
+        cancel head-side-asymmetric illumination noise.
+
+        Returns:
+            float mean green value across both cheek patches,
+            or None if both patches fall outside the frame.
+        """
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            return None
+
+        try:
+            h, w = frame.shape[:2]
+            half = config.CHEEK_ROI_SIZE_PX // 2
+
+            pools = []
+            for landmark_idx in (config.LEFT_CHEEK_LANDMARK,
+                                 config.RIGHT_CHEEK_LANDMARK):
+                try:
+                    cx, cy = landmarks[landmark_idx]
+                except (IndexError, TypeError):
+                    continue
+                x1 = max(0, int(cx) - half)
+                y1 = max(0, int(cy) - half)
+                x2 = min(w, int(cx) + half)
+                y2 = min(h, int(cy) + half)
+                if x2 <= x1 or y2 <= y1:
+                    continue  # cheek patch fell entirely outside frame
+                patch = frame[y1:y2, x1:x2, 1]  # green channel
+                if patch.size == 0:
+                    continue
+                pools.append(patch.astype(np.float64).flatten())
+
+            if not pools:
+                return None
+            return float(np.mean(np.concatenate(pools)))
+
+        except Exception as e:
+            logger.warning(f"Cheek green extraction failed: {e}")
+            return None
+
     def _sample_bg_patches(self, frame, landmarks) -> dict:
         """
         Sample 4 patches adjacent to the face bounding box: top / bottom / left / right.
@@ -625,12 +743,15 @@ class RPPGDetector:
 
     def _result(self, heart_rate: float, quality: float, status: str) -> dict:
         """Build the standard result dict."""
+        active_buffer = (self._cheek_buffer if self._active_roi == "cheek"
+                         else self._green_buffer)
         return {
             "heart_rate":                heart_rate,
             "signal_quality":            quality,
-            "signal_buffer":             list(self._green_buffer),
+            "signal_buffer":             list(active_buffer),
             "filtered_buffer":           getattr(self, "_last_filtered", []),
             "background_correlation":    self.compute_face_background_correlation(),   # legacy, diagnostic only
             "spectral_replay_suspected": self.is_spectral_replay_suspected(),          # Path C primary defence
             "status":                    status,
+            "active_roi":                self._active_roi,
         }

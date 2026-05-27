@@ -11,7 +11,7 @@ import cv2
 from PIL import Image, ImageTk
 import threading
 import config
-from ui.components import StatusIndicator, MetricRow, LogPanel, RPPGGraphPanel
+from ui.components import StatusIndicator, MetricRow, LogPanel, RPPGGraphPanel, FeedbackPanel
 
 
 class Dashboard:
@@ -32,6 +32,10 @@ class Dashboard:
         self._on_close_callback = None
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Latest CheckResult — held so the dev feedback button can write its
+        # full signal vector to CSV when the developer clicks Real/Fake.
+        self._last_check_result = None
+
         self._build_layout()
         self.log.add_entry("TruePixel started. Initializing detectors...")
         print("[Dashboard] UI initialized.")
@@ -39,8 +43,14 @@ class Dashboard:
     def _build_layout(self):
         """Build the two-section layout: top (video + status) + bottom (graph)."""
 
-        # Top section height: video panel + LIVE FEED label + top padding
-        TOP_SECTION_HEIGHT = config.VIDEO_PANEL_HEIGHT + 40
+        # Top section height: the right-side status panel needs more vertical
+        # room than the video itself when DEV_FEEDBACK_BUTTON is on (image
+        # preview + 3 buttons + event log live below the video's bottom edge).
+        # When the feedback button is off, fall back to the tight legacy size.
+        if getattr(config, "DEV_FEEDBACK_BUTTON", False):
+            TOP_SECTION_HEIGHT = config.VIDEO_PANEL_HEIGHT + 240
+        else:
+            TOP_SECTION_HEIGHT = config.VIDEO_PANEL_HEIGHT + 40
 
         # ══ TOP SECTION ═══════════════════════════════════════════════════
         top = tk.Frame(self.root, bg=config.BG_COLOR, height=TOP_SECTION_HEIGHT)
@@ -102,6 +112,18 @@ class Dashboard:
         self.heartbeat_qual  = MetricRow(right, "Signal quality:")
         self.heartbeat_row.pack(fill=tk.X, padx=10, pady=1)
         self.heartbeat_qual.pack(fill=tk.X, padx=10, pady=1)
+
+        # Dev-only feedback panel (Real / Fake buttons for offline tuning)
+        # Renders only when config.DEV_FEEDBACK_BUTTON is True. Set to False
+        # for production builds — see config.py for the security rationale.
+        self.feedback_panel = None
+        if getattr(config, "DEV_FEEDBACK_BUTTON", False):
+            section(right, "DEV LABEL (development only)")
+            self.feedback_panel = FeedbackPanel(
+                right,
+                on_label_callback=self._dev_on_label,
+            )
+            self.feedback_panel.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         # Log panel
         section(right, "EVENT LOG")
@@ -179,17 +201,17 @@ class Dashboard:
             )
             self.heartbeat_qual.update(f"{data.get('signal_quality', 0.0):.2f}")
 
-            # Overall status
-            score = (data.get("face_confidence", 0.0) * config.FACE_MATCH_WEIGHT +
-                     (1.0 if 10 <= blink_rate <= 25 else 0.0) * config.BLINK_WEIGHT +
-                     min(data.get("signal_quality", 0.0), 1.0) * config.HEARTBEAT_WEIGHT)
-
-            if score >= config.COMPOSITE_ALERT_THRESHOLD:
-                self.status_indicator.set_verified()
-            elif data.get("face_name") == "No faces enrolled":
-                self.status_indicator.set_initializing()
+            # Overall status — prefer the authoritative CheckResult (set by
+            # notify_check_complete) over the per-frame heuristic so that the
+            # banner says VERIFIED or names the specific failure reason.
+            result = self._last_check_result
+            if result is not None:
+                if result.passed:
+                    self.status_indicator.set_verified()
+                else:
+                    self.status_indicator.set_alert(result.short_failure_reason())
             else:
-                self.status_indicator.set_alert()
+                self.status_indicator.set_initializing()
 
         self.root.after(0, _update)
 
@@ -268,6 +290,139 @@ class Dashboard:
                 color = config.TEXT_COLOR
             self._countdown_label.config(text=text, fg=color)
         self.root.after(0, _u)
+
+    def notify_check_complete(self, result):
+        """
+        Called by main.py after a verification check finishes.
+        Stores the full CheckResult so the dev feedback button can write
+        its signal vector to CSV when the developer clicks Real/Fake,
+        and enables the buttons for this new check_number.
+        The burst frame (result.last_frame) is passed through so the
+        FeedbackPanel can show the exact image being labelled — useful
+        when transitioning between real face and replay attack mid-burst.
+        """
+        self._last_check_result = result
+        if self.feedback_panel is not None:
+            # Use Tk's after() so this is safe to call from any thread.
+            self.root.after(0, lambda: self.feedback_panel.set_pending_check(
+                result.check_number, result.last_frame, result.passed
+            ))
+
+    def _dev_on_label(self, label, check_number):
+        """
+        Internal: invoked by FeedbackPanel when the developer clicks
+        Real, Fake, or Ignore. For Real/Fake: appends a labelled row to
+        logs/dev_feedback.csv containing every signal we computed for the
+        check, and saves the burst frame to logs/feedback_images/ so the
+        labelled dataset has the image alongside the metrics. For Ignore:
+        no row is written and no image is saved — the developer was unsure
+        which face was in the captured frame (e.g. mid-transition between
+        real and replay) and chose not to teach the model from it.
+
+        Offline analysis (scripts/analyze_feedback.py) consumes the CSV to
+        suggest threshold adjustments.
+
+        SECURITY: this writes to disk only. It does NOT update any model or
+        threshold at runtime. The developer reviews the CSV offline.
+        """
+        import csv
+        import os
+        from datetime import datetime
+
+        result = self._last_check_result
+        if result is None or result.check_number != check_number:
+            self.log.add_entry(
+                f"DEV: label '{label}' ignored — no matching check #{check_number}."
+            )
+            return
+
+        if label == "ignore":
+            self.log.add_entry(
+                f"DEV: check #{check_number} ignored (not added to dataset)."
+            )
+            return
+
+        # Save the burst frame alongside the labelled row so the dataset
+        # has the image evidence next to the signal vector. Filename embeds
+        # the check number + label + timestamp for unambiguous matching.
+        image_path = ""
+        if result.last_frame is not None:
+            img_dir = os.path.join("logs", "feedback_images")
+            os.makedirs(img_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            image_path = os.path.join(
+                img_dir, f"check_{check_number:04d}_{label}_{stamp}.jpg"
+            )
+            try:
+                cv2.imwrite(image_path, result.last_frame)
+            except Exception as e:
+                self.log.add_entry(f"DEV: failed to save labelled image: {e}")
+                image_path = ""
+
+        csv_path = config.DEV_FEEDBACK_CSV_PATH
+        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        file_exists = os.path.exists(csv_path)
+
+        header = [
+            "timestamp",
+            "check_number",
+            "ground_truth",        # the developer's label: "real" or "fake"
+            "system_verdict",      # what TruePixel decided: "PASS" or "FAIL"
+            "system_replay_flag",  # did the replay defence fire?
+            "composite_score",
+            "face_confidence",
+            "blink_rate_per_min",
+            "ear",
+            "ear_variance",
+            "iris_drift",
+            "head_drift",
+            "mouth_var",
+            "liveness_score",
+            "liveness_signals_active",
+            "signal_quality",      # rPPG
+            "heart_rate_bpm",
+            "lbp_variance",
+            "texture_screen_suspected",
+            "background_correlation",
+            "alert_reason",
+            "image_path",
+        ]
+        row = [
+            datetime.now().isoformat(timespec="seconds"),
+            result.check_number,
+            label,
+            "PASS" if result.passed else "FAIL",
+            result.replay_suspected,
+            f"{result.composite_score:.4f}",
+            f"{result.face_confidence:.4f}",
+            f"{result.blink_rate:.2f}",
+            f"{result.ear:.4f}",
+            f"{result.ear_variance:.6f}",
+            f"{result.iris_drift:.3f}",
+            f"{result.head_drift:.3f}",
+            f"{result.mouth_var:.3f}",
+            f"{result.liveness_score:.2f}",
+            result.liveness_signals_active,
+            f"{result.signal_quality:.4f}",
+            f"{result.heart_rate:.1f}",
+            f"{result.lbp_variance:.6f}",
+            result.texture_screen_suspected,
+            f"{result.background_correlation:.4f}",
+            (result.alert_reason or "").replace(",", ";"),
+            image_path,
+        ]
+        try:
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(header)
+                writer.writerow(row)
+            self.log.add_entry(
+                f"DEV: labelled check #{check_number} as '{label}' "
+                f"→ {csv_path}"
+            )
+        except Exception as e:
+            self.log.add_entry(f"DEV: failed to write feedback CSV: {e}")
 
     def on_close(self, callback):
         """Register a callback for when the window is closed."""

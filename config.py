@@ -19,6 +19,65 @@ LOW_BLINK_RATE_THRESHOLD = 5  # blinks/min — below this is suspicious
 LEFT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
 
+# ── Multi-signal liveness (Improvement 1) ────────────────────────────────────
+# When no blinks occur during an 8s burst, look for OTHER signs of life:
+# EAR jitter (eye micro-movement), iris drift, head pose drift, mouth variance.
+# A static photo has ALL of these = 0. A real human has at least one active.
+# Reference: Rahul's deployment insight + Soukupova-Cech 2016 extended.
+#
+# Coordinate space: PIXEL integers (face_mesh.py converts before passing).
+# Thresholds tuned for 640x480 frame; scale proportionally for other sizes.
+LIVENESS_EAR_VAR_MIN          = 0.0005   # std of EAR samples across burst (EAR is dimensionless)
+LIVENESS_IRIS_DRIFT_MIN_PX    = 1.5      # total iris-center movement across burst (pixels)
+LIVENESS_HEAD_DRIFT_MIN_PX    = 2.0      # nose-tip position std across burst (pixels)
+LIVENESS_MOUTH_VAR_MIN_PX     = 0.5      # std of mouth opening + width (pixels)
+LIVENESS_MIN_SIGNALS_FOR_FULL    = 2     # ≥2 non-blink signals fire → score 1.0
+LIVENESS_MIN_SIGNALS_FOR_PARTIAL = 1     # exactly 1 fires → score 0.7
+
+# Mouth landmark indices (MediaPipe Face Mesh)
+MOUTH_TOP_LIP_CENTER    = 13     # upper lip inner
+MOUTH_BOTTOM_LIP_CENTER = 14     # lower lip inner
+MOUTH_LEFT_CORNER       = 61
+MOUTH_RIGHT_CORNER      = 291
+
+# Iris and head landmarks
+IRIS_LEFT_CENTER  = 468   # left iris center (requires refine_landmarks=True)
+NOSE_TIP_LANDMARK = 1
+
+# ── LBP texture defence (Improvement 2 / Layer 2 replay) ─────────────────────
+# Detector computes np.var() of the RAW LBP image (P=8, R=1, method='uniform').
+# LBP values are in [0, 9] for the uniform-pattern set.
+#
+# EMPIRICAL CALIBRATION (Rahul's office, 1080p webcam, May 2026):
+#   - Real face (12 samples):       lbp_variance range 4.85 – 5.35  (mean ~5.07)
+#   - Phone replay (15 samples):    lbp_variance range 2.89 – 4.54  (mean ~3.50)
+#   - Clean separation gap:         0.30 wide between max-replay and min-real
+#   - Threshold below picked at the midpoint (4.70) of that gap.
+#
+# CALIBRATION CAVEAT: this threshold is environment-dependent. Different
+# lighting, camera, or person may shift both populations. Before deploying
+# to a new laptop / employee, run the validate_rppg script (or just main.py)
+# for ~10 cycles in normal conditions, look at the lbp= values, and adjust
+# the threshold to sit inside the observed gap. If real-face values overlap
+# with phone-replay values on a new setup, this defence won't work there
+# and texture_screen_suspected should be force-disabled.
+#
+# Reference: Chingovska et al., IEEE BIOSIG 2012.
+TEXTURE_LBP_VARIANCE_MIN = 4.70   # below this → screen suspected (empirical, May 2026)
+TEXTURE_PATCH_SIZE_PX    = 64     # cheek patch dimensions for LBP
+
+# Cheek landmark indices (MediaPipe Face Mesh)
+LEFT_CHEEK_LANDMARK  = 50
+RIGHT_CHEEK_LANDMARK = 280
+
+# rPPG fallback ROI — when forehead is occluded (cap, hair, hand), the rPPG
+# detector secondarily samples a square patch of CHEEK_ROI_SIZE_PX pixels
+# around each cheek landmark, averages green channel across both cheeks,
+# and switches to that buffer if it carries a stronger signal than forehead.
+# Smaller than the texture patch (64 px) because rPPG only needs enough
+# pixels to average out sensor noise — 40×40 = 1600 pixels per cheek.
+CHEEK_ROI_SIZE_PX = 40
+
 # rPPG heartbeat detection
 # rPPG buffer matches burst duration exactly (8s at 15fps = 120 samples)
 # FFT resolution = 15/120 = 0.125 Hz = ±7.5 BPM accuracy at 60 BPM
@@ -38,7 +97,22 @@ FOREHEAD_LANDMARKS = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288]
 FACE_MATCH_THRESHOLD = 0.60
 ENROLLED_FACES_DIR = "data/enrolled"
 ENROLLMENT_PHOTO_COUNT = 3
-ENROLLMENT_COUNTDOWN_SECONDS = 2
+# 5 seconds between each pose — gives the user time to read the instruction,
+# physically turn their head 15° left/right, and settle before the camera snaps.
+# Counter is shown live on the preview during enrollment.
+ENROLLMENT_COUNTDOWN_SECONDS = 5
+
+# ── Development-only feedback collection ─────────────────────────────────────
+# When True, the dashboard shows two buttons (Real / Fake) above the event log
+# so the developer can label each verification check. Labels + all signal
+# values are appended to logs/dev_feedback.csv for offline threshold tuning
+# via scripts/analyze_feedback.py.
+#
+# SECURITY: this MUST be False in any production deployment. A trusted user
+# clicking "real" on a real attack would teach the system to accept that
+# attack. Safe only when the labelling developer is also the operator.
+DEV_FEEDBACK_BUTTON = True
+DEV_FEEDBACK_CSV_PATH = "logs/dev_feedback.csv"
 
 # ── Verification Mode ─────────────────────────────────────────────────────────
 # TEST_MODE = True  → verifies every 10 seconds (use during development)

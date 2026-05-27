@@ -333,6 +333,87 @@ def test_rppg_reset_clears_buffer():
     assert det._last_status     == "Initializing"
 
 
+def test_rppg_fallback_picks_cheek_when_forehead_is_flat():
+    """
+    Forehead occluded (cap, hair, hand) → forehead buffer is near-constant,
+    cheek buffer carries a real pulse. _pick_active_roi must choose cheek.
+    """
+    from core.rppg_detector import RPPGDetector
+    import config
+
+    det = RPPGDetector()
+    n   = det._buffer_size
+
+    # Forehead: flat (occluded by something static — fabric, hair)
+    for _ in range(n):
+        det._green_buffer.append(50.0)
+
+    # Cheek: clean 1.2 Hz pulse at typical skin intensity
+    t = np.linspace(0, config.RPPG_BUFFER_SECONDS, n)
+    pulse = 150.0 + 3.0 * np.sin(2 * np.pi * 1.2 * t)
+    for v in pulse:
+        det._cheek_buffer.append(float(v))
+
+    chosen_buf, chosen_roi = det._pick_active_roi(1.0, 1.0)
+    assert chosen_roi == "cheek", (
+        f"Expected cheek fallback when forehead is flat, got '{chosen_roi}'"
+    )
+    assert chosen_buf is det._cheek_buffer
+
+
+def test_rppg_prefers_forehead_when_both_signals_strong():
+    """
+    Normal case: both ROIs carry pulse with comparable amplitude. Forehead
+    should be preferred (cleaner ROI, less talking-noise). Selection rule
+    requires cheek_std > forehead_std × 1.10 to flip.
+    """
+    from core.rppg_detector import RPPGDetector
+    import config
+
+    det = RPPGDetector()
+    n   = det._buffer_size
+    t   = np.linspace(0, config.RPPG_BUFFER_SECONDS, n)
+
+    # Both buffers get the same-amplitude pulse — forehead should win the tie
+    forehead = 150.0 + 4.0 * np.sin(2 * np.pi * 1.2 * t)
+    cheek    = 150.0 + 4.0 * np.sin(2 * np.pi * 1.2 * t)
+    for v in forehead:
+        det._green_buffer.append(float(v))
+    for v in cheek:
+        det._cheek_buffer.append(float(v))
+
+    _, chosen_roi = det._pick_active_roi(1.0, 1.0)
+    assert chosen_roi == "forehead", (
+        f"Expected forehead preference on tie, got '{chosen_roi}'"
+    )
+
+
+def test_rppg_extract_cheek_green_mean_handles_missing_landmarks():
+    """
+    _extract_cheek_green_mean must return None (not crash) when the cheek
+    landmark indices fall outside the landmark list.
+    """
+    from core.rppg_detector import RPPGDetector
+    det = RPPGDetector()
+    # 5-element landmark list — both cheek indices (50, 280) are out of range
+    fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    fake_landmarks = [(10, 10)] * 5
+    result = det._extract_cheek_green_mean(fake_frame, fake_landmarks)
+    assert result is None
+
+
+def test_rppg_reset_clears_cheek_and_active_roi():
+    """reset() must also clear the cheek buffer and reset _active_roi."""
+    from core.rppg_detector import RPPGDetector
+    det = RPPGDetector()
+    for v in range(30):
+        det._cheek_buffer.append(float(v))
+    det._active_roi = "cheek"
+    det.reset()
+    assert len(det._cheek_buffer) == 0
+    assert det._active_roi == "forehead"
+
+
 def test_legacy_pearson_returns_high_for_identical_signals():
     """
     LEGACY API test (Pearson method is deprecated for replay defence in Path C,
@@ -710,6 +791,10 @@ check("RPPGDetector instantiates with empty buffer",      test_rppg_instantiates
 check("RPPGDetector handles None landmarks gracefully",   test_rppg_no_face_returns_no_signal)
 check("RPPGDetector FFT detects 1.2 Hz sine as ~72 BPM", test_rppg_synthetic_sine_detects_bpm)
 check("RPPGDetector reset clears all state",              test_rppg_reset_clears_buffer)
+check("rPPG fallback picks cheek when forehead is flat",   test_rppg_fallback_picks_cheek_when_forehead_is_flat)
+check("rPPG prefers forehead when both signals strong",    test_rppg_prefers_forehead_when_both_signals_strong)
+check("Cheek extraction returns None on missing landmarks", test_rppg_extract_cheek_green_mean_handles_missing_landmarks)
+check("Reset clears cheek buffer and active_roi",          test_rppg_reset_clears_cheek_and_active_roi)
 check("rPPG buffer fill ratio reachable from burst config", test_rppg_buffer_fill_ratio_matches_burst)
 check("Video replay attack fails with noise floor",    test_video_replay_attack_fails)
 check("Real user office lighting passes",              test_real_user_office_lighting_passes)
@@ -727,6 +812,150 @@ check("Spectral replay True when BG shares face peak freq",     test_is_spectral
 check("Spectral replay False when BG peak differs from face",   test_is_spectral_replay_suspected_false_when_bg_different_freq)
 check("Spectral replay False on empty BG buffers",              test_is_spectral_replay_suspected_false_on_empty_buffers)
 check("Spectral replay False on flat (no-peak) face signal",    test_is_spectral_replay_suspected_false_on_weak_face_signal)
+
+
+# ── Multi-signal liveness (Improvement 1) ───────────────────────────────────
+
+def test_liveness_static_photo_all_zeros():
+    """
+    Static photo: identical landmarks across all frames → every signal = 0
+    → liveness_score must be 0.0 (would correctly fail a real photo attack).
+    """
+    from core.blink_detector import BlinkDetector
+    det = BlinkDetector()
+    det.reset()
+    det._burst_blink_count = 0
+    for _ in range(120):
+        det._ear_samples.append(0.30)              # static open eye, no jitter
+        det._iris_positions.append((320, 240))     # constant pixel position
+        det._nose_positions.append((320, 320))
+        det._mouth_heights.append(8.0)
+        det._mouth_widths.append(40.0)
+    result = det.compute_liveness_score()
+    assert result["score"] == 0.0, (
+        f"Static photo should score 0.0, got {result['score']} "
+        f"(signals_active={result['signals_active']})"
+    )
+
+
+def test_liveness_two_blinks_short_circuits_to_full():
+    """2+ blinks during burst → liveness_score = 1.0 immediately."""
+    from core.blink_detector import BlinkDetector
+    det = BlinkDetector()
+    det.reset()
+    det._burst_blink_count = 2
+    result = det.compute_liveness_score()
+    assert result["score"] == 1.0, (
+        f"2+ blinks should short-circuit to 1.0, got {result['score']}"
+    )
+
+
+def test_liveness_no_blinks_multiple_signals_active_gives_full():
+    """
+    No blinks but iris drift + head drift + mouth jitter all active
+    → 3 signals → score = 1.0 (≥ LIVENESS_MIN_SIGNALS_FOR_FULL).
+    """
+    from core.blink_detector import BlinkDetector
+    det = BlinkDetector()
+    det.reset()
+    det._burst_blink_count = 0
+
+    # Static EAR (eye not micro-moving)
+    det._ear_samples = [0.30] * 120
+    # Iris drifts measurably (sinusoidal pixel jitter)
+    det._iris_positions = [
+        (320 + int(2.0 * np.sin(i * 0.3)),
+         240 + int(2.0 * np.cos(i * 0.3)))
+        for i in range(120)
+    ]
+    # Nose moves (head sway in pixels)
+    det._nose_positions = [
+        (320 + int(3.0 * np.sin(i * 0.2)),
+         320 + int(3.0 * np.cos(i * 0.2)))
+        for i in range(120)
+    ]
+    # Mouth opening varies (talking)
+    det._mouth_heights = [8.0 + 2.0 * np.sin(i * 0.4) for i in range(120)]
+    det._mouth_widths  = [40.0] * 120
+
+    result = det.compute_liveness_score()
+    assert result["score"] == 1.0, (
+        f"3 non-blink signals should give 1.0, got {result['score']} "
+        f"(active={result['signals_active']})"
+    )
+
+
+def test_liveness_single_signal_gives_partial():
+    """Only head moves; everything else static → exactly 1 signal → 0.7."""
+    from core.blink_detector import BlinkDetector
+    det = BlinkDetector()
+    det.reset()
+    det._burst_blink_count = 0
+    det._ear_samples = [0.30] * 120
+    det._iris_positions = [(320, 240)] * 120     # static iris
+    det._nose_positions = [
+        (320 + int(4.0 * np.sin(i * 0.2)), 320)  # head sways measurably
+        for i in range(120)
+    ]
+    det._mouth_heights = [8.0] * 120
+    det._mouth_widths  = [40.0] * 120
+
+    result = det.compute_liveness_score()
+    assert result["score"] == 0.7, (
+        f"Exactly one signal should give 0.7, got {result['score']} "
+        f"(active={result['signals_active']})"
+    )
+
+
+# ── LBP texture defence (Improvement 2) ─────────────────────────────────────
+
+def test_texture_uniform_patch_is_screen():
+    """Uniform-grey frame → near-zero LBP variance → flagged as screen."""
+    from core.texture_detector import TextureDetector
+    det = TextureDetector()
+    frame = np.full((480, 640, 3), 128, dtype=np.uint8)   # uniform grey
+    # landmarks is a list of (x,y) pixel tuples; landmark 50 = left cheek
+    landmarks = [(320, 240)] * 500   # all landmarks at the centre, fine for this test
+    result = det.analyze(frame, landmarks)
+    assert result["is_screen_suspected"] is True, (
+        f"Uniform patch should be flagged as screen. "
+        f"lbp_variance={result['lbp_variance']:.6f}"
+    )
+
+
+def test_texture_noisy_patch_is_skin():
+    """Random-noise frame → high LBP variance → not flagged."""
+    from core.texture_detector import TextureDetector
+    det = TextureDetector()
+    rng = np.random.default_rng(seed=7)
+    frame = rng.integers(0, 255, (480, 640, 3), dtype=np.uint8)
+    landmarks = [(320, 240)] * 500
+    result = det.analyze(frame, landmarks)
+    assert result["is_screen_suspected"] is False, (
+        f"Noisy patch should NOT be flagged. "
+        f"lbp_variance={result['lbp_variance']:.6f}"
+    )
+
+
+def test_texture_none_inputs_return_safe_default():
+    """None frame / None landmarks must return safe default — no crash."""
+    from core.texture_detector import TextureDetector
+    det = TextureDetector()
+    r1 = det.analyze(None, None)
+    assert r1["is_screen_suspected"] is False
+    assert r1["lbp_variance"] == 0.0
+    r2 = det.analyze(None, [(0, 0)])
+    assert r2["is_screen_suspected"] is False
+    r3 = det.analyze(np.zeros((100, 100, 3), dtype=np.uint8), None)
+    assert r3["is_screen_suspected"] is False
+
+check("Liveness: static photo scores 0.0",                     test_liveness_static_photo_all_zeros)
+check("Liveness: 2+ blinks short-circuits to 1.0",             test_liveness_two_blinks_short_circuits_to_full)
+check("Liveness: 3 non-blink signals -> 1.0",                  test_liveness_no_blinks_multiple_signals_active_gives_full)
+check("Liveness: 1 non-blink signal -> 0.7",                   test_liveness_single_signal_gives_partial)
+check("Texture: uniform patch flagged as screen",              test_texture_uniform_patch_is_screen)
+check("Texture: noisy patch NOT flagged as screen",            test_texture_noisy_patch_is_skin)
+check("Texture: None inputs return safe default",              test_texture_none_inputs_return_safe_default)
 
 print("=" * 50)
 passed = sum(results)

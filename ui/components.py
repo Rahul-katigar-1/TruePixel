@@ -10,9 +10,17 @@ from datetime import datetime
 
 # matplotlib for the embedded rPPG graph panel
 import numpy as np
+import cv2
+from PIL import Image, ImageTk
 from scipy import signal as scipy_signal
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Preview thumbnail size for the dev-feedback image panel.
+# Kept small (220x165 ≈ 4:3 aspect) so the panel still has room for the
+# Real/Fake/Ignore buttons and the event log below it without scrolling.
+FEEDBACK_THUMB_WIDTH  = 220
+FEEDBACK_THUMB_HEIGHT = 165
 
 
 class StatusIndicator(tk.Frame):
@@ -102,6 +110,154 @@ class LogPanel(tk.Frame):
         self._text.config(state=tk.DISABLED)
 
 
+class FeedbackPanel(tk.Frame):
+    """
+    DEV-MODE-ONLY feedback widget. Renders a thumbnail of the burst frame
+    plus three buttons (Real / Fake / Ignore) above the event log so the
+    developer can label each verification check.
+
+    The thumbnail matters because the burst captures 120 frames over 8s —
+    if the developer switched between phone-replay and real face mid-burst,
+    the "representative" frame may not be what they expected. Showing it
+    explicitly removes that ambiguity before they click.
+
+    SECURITY: do NOT enable in production builds (config.DEV_FEEDBACK_BUTTON
+    must be False before shipping to employees). A trusted user labelling
+    real attacks as "real" would teach the system to accept those attacks.
+
+    Usage from Dashboard:
+        self.feedback_panel = FeedbackPanel(parent, on_label_callback=self._on_label)
+        self.feedback_panel.set_pending_check(check_number, frame, passed)
+        ... user clicks → on_label_callback("real" | "fake" | "ignore", check_number)
+    """
+
+    def __init__(self, parent, on_label_callback, **kwargs):
+        super().__init__(parent, bg=config.PANEL_BG, **kwargs)
+        self._on_label = on_label_callback
+        self._pending_check = None  # check_number waiting to be labelled
+
+        # Status line (which check is being labelled, what the system thought)
+        self._status = tk.Label(
+            self, text="No check yet", font=("Courier", 9),
+            bg=config.PANEL_BG, fg=config.TEXT_COLOR,
+            justify=tk.LEFT, anchor="w",
+        )
+        self._status.pack(fill=tk.X, padx=8, pady=(4, 2))
+
+        # Image preview — the burst frame the developer is about to label.
+        # Black placeholder until set_pending_check delivers the first frame.
+        self._image_label = tk.Label(
+            self, bg="#000000",
+            width=FEEDBACK_THUMB_WIDTH, height=FEEDBACK_THUMB_HEIGHT,
+        )
+        self._image_label.pack(padx=8, pady=(0, 4))
+        self._image_ref = None  # keep PhotoImage alive
+
+        # Button row (Real / Fake / Ignore)
+        btn_row = tk.Frame(self, bg=config.PANEL_BG)
+        btn_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        self._real_btn = tk.Button(
+            btn_row, text="✓ Real",
+            font=("Courier", 9, "bold"),
+            bg="#143d2a", fg=config.VERIFIED_COLOR,
+            activebackground="#1c5238", activeforeground=config.VERIFIED_COLOR,
+            relief=tk.FLAT, padx=8, pady=4,
+            state=tk.DISABLED,
+            command=lambda: self._click("real"),
+        )
+        self._real_btn.pack(side=tk.LEFT, padx=(0, 4), expand=True, fill=tk.X)
+
+        self._fake_btn = tk.Button(
+            btn_row, text="✗ Fake",
+            font=("Courier", 9, "bold"),
+            bg="#3d1414", fg=config.ALERT_COLOR,
+            activebackground="#521c1c", activeforeground=config.ALERT_COLOR,
+            relief=tk.FLAT, padx=8, pady=4,
+            state=tk.DISABLED,
+            command=lambda: self._click("fake"),
+        )
+        self._fake_btn.pack(side=tk.LEFT, padx=(0, 4), expand=True, fill=tk.X)
+
+        self._ignore_btn = tk.Button(
+            btn_row, text="− Ignore",
+            font=("Courier", 9, "bold"),
+            bg="#2a2a3a", fg=config.TEXT_COLOR,
+            activebackground="#3a3a4a", activeforeground=config.TEXT_COLOR,
+            relief=tk.FLAT, padx=8, pady=4,
+            state=tk.DISABLED,
+            command=lambda: self._click("ignore"),
+        )
+        self._ignore_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+    def set_pending_check(self, check_number, frame=None, passed=None):
+        """
+        Called by Dashboard after each new check completes.
+        Args:
+            check_number: id of the check to label
+            frame: numpy BGR frame from the burst (or None)
+            passed: bool — what the system decided (for status line context)
+        """
+        self._pending_check = check_number
+
+        verdict = ""
+        if passed is True:
+            verdict = "  (system: PASS)"
+        elif passed is False:
+            verdict = "  (system: FAIL)"
+        self._status.config(
+            text=f"Label check #{check_number}{verdict}:",
+            fg=config.AMBER_COLOR,
+        )
+
+        # Render the preview thumbnail — convert BGR → RGB → PIL → PhotoImage.
+        if frame is not None:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb).resize(
+                    (FEEDBACK_THUMB_WIDTH, FEEDBACK_THUMB_HEIGHT)
+                )
+                self._image_ref = ImageTk.PhotoImage(img)
+                self._image_label.config(image=self._image_ref)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"FeedbackPanel preview render failed: {e}"
+                )
+
+        self._real_btn.config(state=tk.NORMAL)
+        self._fake_btn.config(state=tk.NORMAL)
+        self._ignore_btn.config(state=tk.NORMAL)
+
+    def _click(self, label):
+        """Internal: handle a button press and disable until next check."""
+        if self._pending_check is None:
+            return
+        check_n = self._pending_check
+        # Disable so the same check isn't double-labelled
+        self._real_btn.config(state=tk.DISABLED)
+        self._fake_btn.config(state=tk.DISABLED)
+        self._ignore_btn.config(state=tk.DISABLED)
+        status_color = {
+            "real":   config.VERIFIED_COLOR,
+            "fake":   config.ALERT_COLOR,
+            "ignore": config.TEXT_COLOR,
+        }.get(label, config.TEXT_COLOR)
+        self._status.config(
+            text=f"Logged check #{check_n} as: {label.upper()}",
+            fg=status_color,
+        )
+        self._pending_check = None
+        # Fire the callback (this writes to CSV in the Dashboard layer)
+        try:
+            self._on_label(label, check_n)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"FeedbackPanel callback failed: {e}"
+            )
+
+
 class RPPGGraphPanel(tk.Frame):
     """
     Embedded matplotlib panel showing the live rPPG signal during normal operation.
@@ -119,9 +275,11 @@ class RPPGGraphPanel(tk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=config.BG_COLOR, **kwargs)
 
-        # Figure sized for the bottom panel — 10.5 inches wide, ~3.0 tall at 80 dpi
-        # gives ~840 × 240 px content; pack will fill the rest of the frame.
-        self._fig = Figure(figsize=(10.5, 3.0), dpi=80, facecolor=config.BG_COLOR)
+        # Figure sized for the bottom panel — 10.5 inches wide, ~2.3 tall at 80 dpi
+        # gives ~840 × 184 px content; pack will fill the rest of the frame.
+        # Reduced from 3.0 → 2.3 to free vertical space for the dev-feedback
+        # buttons + event log in the top section.
+        self._fig = Figure(figsize=(10.5, 2.3), dpi=80, facecolor=config.BG_COLOR)
         self._ax_raw      = self._fig.add_subplot(311)
         self._ax_filtered = self._fig.add_subplot(312)
         self._ax_bpm      = self._fig.add_subplot(313)
@@ -178,8 +336,16 @@ class RPPGGraphPanel(tk.Frame):
         Pull current buffer + last result from a running RPPGDetector and redraw.
         Designed to be called at ~5 Hz from main.py's frame loop (every ~3 frames
         at 15fps target) to avoid GIL pressure on the main UI thread.
+
+        Plots whichever ROI buffer (forehead vs cheek) the detector is currently
+        treating as active, so the displayed signal matches the BPM and quality
+        readings shown to the user.
         """
-        buf = list(detector._green_buffer)
+        active_roi = getattr(detector, "_active_roi", "forehead")
+        if active_roi == "cheek":
+            buf = list(detector._cheek_buffer)
+        else:
+            buf = list(detector._green_buffer)
         if len(buf) == 0:
             return
 
@@ -229,10 +395,13 @@ class RPPGGraphPanel(tk.Frame):
                 )
             self._bpm_text.set_text(f"BPM: {hr:.0f}")
 
-        # Quality + status overlay
+        # Quality + status overlay (includes ROI source so the user can see
+        # when the detector has fallen back to cheek because forehead is
+        # occluded by a cap, hair, or hand).
         self._quality_text.set_text(
             f"Quality: {detector._last_quality:.3f}   "
             f"Status: {detector._last_status}   "
+            f"ROI: {active_roi}   "
             f"Buffer: {len(buf)}/{detector._buffer_size}"
         )
 

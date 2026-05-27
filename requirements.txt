@@ -25,6 +25,11 @@ numpy==1.24.3
 # Signal processing for rPPG heartbeat detection
 scipy==1.11.4
 
+# Image-processing primitives for LBP texture defence (Layer 2 anti-replay).
+# 0.22.0 is compatible with our numpy==1.24.3 and Python 3.11.9.
+# Do NOT upgrade to >=0.25 — those require numpy>=2.0 at build time.
+scikit-image==0.22.0
+
 # UI and visualisation
 matplotlib==3.7.5
 Pillow==10.2.0
