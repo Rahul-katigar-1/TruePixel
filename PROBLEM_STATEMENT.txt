@@ -1,0 +1,406 @@
+================================================================================
+TRUEPIXEL — PROBLEM STATEMENT
+================================================================================
+
+A focused statement of the problem TruePixel exists to solve.
+For implementation details and current architecture see KNOWLEDGE_TRANSFER.txt.
+For chronological development log see PROGRESS.md.
+
+
+================================================================================
+1. CONTEXT
+================================================================================
+
+Infosys employees join video calls daily over Microsoft Teams, Zoom, and
+similar platforms. These calls are the primary medium for:
+
+  - Client meetings (where confidential project material is discussed)
+  - Internal stand-ups, design reviews, and approvals
+  - Training and certifications (attendance is recorded)
+  - Performance reviews and HR discussions
+  - Access requests where verbal authorisation grants permissions
+
+In every one of these scenarios, the system assumes the person visible on
+camera is who they claim to be. Today, that assumption is unverified. The
+laptop's webcam shows a face; Teams shows a name next to it; the meeting
+proceeds.
+
+There is no real-time mechanism on a standard employee laptop to confirm
+the live face on camera matches the enrolled employee — and is a real
+human, not a recording or a digital impersonation.
+
+
+================================================================================
+2. THE PROBLEM
+================================================================================
+
+A bad actor can defeat current video-call identity assumptions using
+techniques that require no special equipment:
+
+2.1 Video replay attack
+    A pre-recorded video of an employee (sourced from social media, a
+    previous internal meeting recording, or a covert capture) played back
+    on a phone or tablet held in front of the webcam.
+
+2.2 Photo / printed attack
+    A high-resolution photograph of an employee, printed or shown on a
+    second screen, held in front of the webcam.
+
+2.3 Deepfake driven by a different person
+    An AI-generated face swap controlled by an attacker's audio/video,
+    rendered in real time on the webcam.
+
+2.4 Substitution under coercion
+    A trusted person is replaced or coerced into participating in a
+    meeting on someone else's behalf.
+
+2.5 Identity confusion / look-alikes
+    A close relative or look-alike participates instead of the enrolled
+    employee, possibly with consent of that employee.
+
+In all five cases the existing video-call platform treats the imposter
+as the legitimate employee. There is no signal that anything is wrong.
+
+
+================================================================================
+3. WHY THIS MATTERS (BUSINESS IMPACT)
+================================================================================
+
+The cost of unverified identity in employee video calls falls on Infosys
+in several distinct ways:
+
+3.1 Information leakage
+    Client material discussed in meetings reaches an unauthorised party
+    when an imposter joins. Depending on the client, this may breach NDAs
+    or contractual confidentiality obligations and result in financial
+    penalties or loss of the account.
+
+3.2 Fraudulent attendance and credentialing
+    Training sessions, certifications, and performance reviews assume the
+    attendee is the named person. Successful impersonation produces
+    credentials and HR records that do not reflect reality.
+
+3.3 Unauthorised access via verbal approval
+    Production systems, client data, and elevated permissions are routinely
+    granted on the basis of "I see you on the call, you're approved." An
+    imposter on a call can extract those approvals.
+
+3.4 Audit and compliance failure
+    Regulated client work (banking, healthcare, government) requires
+    verifiable participant identity. Failure to demonstrate verification
+    is itself a compliance gap, separately from any actual breach.
+
+3.5 Trust erosion if exploited at scale
+    A single successful demonstration that the system can be defeated
+    undermines trust in every video-mediated approval and decision Infosys
+    relies on. The cost is not just the incident but the chilling effect
+    on remote workflows.
+
+
+================================================================================
+4. WHO IS AFFECTED
+================================================================================
+
+Primary stakeholders (gain protection if the problem is solved):
+
+  - Infosys employees, whose identity is currently impersonable without
+    their knowledge or consent
+  - Infosys clients, whose confidential material is exposed when employees
+    can be impersonated in client-facing meetings
+  - Infosys leadership and compliance teams, who carry the audit risk
+
+Secondary stakeholders (must accept the solution into their workflow):
+
+  - Infosys IT department, who must deploy and support the solution on
+    every employee laptop without breaking existing software
+  - Infosys employees again, this time in their day-to-day capacity:
+    the solution must NOT interrupt them, prompt them, or visibly slow
+    their machine
+
+Adversaries (intentionally not stakeholders but must be understood):
+
+  - External attackers with social-engineering access to employee photos
+    or recorded videos
+  - Insiders attempting impersonation for fraud or harassment
+  - Curious employees who learn an exploit exists and share it informally
+
+
+================================================================================
+5. CURRENT STATE OF SOLUTIONS
+================================================================================
+
+5.1 What exists in the market today
+    Apple Face ID, Microsoft Windows Hello, and bank-app face login all
+    perform live face verification. They work — but they rely on hardware
+    not present on standard Infosys laptops:
+
+      - IR depth sensors (Face ID, Hello)
+      - Time-of-flight cameras (high-end smartphones)
+      - Dual-camera stereoscopic depth
+
+    Without specialised hardware, every commercial face-verification
+    product becomes vulnerable to the same replay/photo/deepfake attacks
+    described in Section 2.
+
+5.2 What does NOT exist
+    A software-only, real-time, passive identity verification layer that:
+      - Runs alongside any video-call client
+      - Uses only the standard webcam already on the laptop
+      - Requires no user interaction during calls
+      - Continuously monitors for impersonation rather than checking once
+        at login
+
+5.3 Why nobody has shipped this yet
+    The technical challenge is real: distinguishing a live face from a
+    high-quality recording on a webcam, using only software, in arbitrary
+    office lighting, is at the frontier of computer-vision anti-spoofing
+    research. The methods exist in academic papers (rPPG, LBP texture
+    analysis, PPGSecure, FAS-CNN) but no productised tool combines them
+    into a deployment-ready desktop application aligned to a corporate
+    deployment context.
+
+
+================================================================================
+6. DESIRED OUTCOME
+================================================================================
+
+A desktop application that runs silently on every Infosys employee laptop
+and continuously verifies, while any video call is active, that:
+
+  6.1 The face on camera matches the enrolled employee's face
+      (identity verification — who is this?)
+
+  6.2 The face on camera belongs to a living human, not a recording
+      (liveness verification — is this actually happening right now?)
+
+  6.3 The verification happens passively, with no impact on the
+      employee's workflow — no challenges, no popups, no waiting
+
+  6.4 Failed verification produces a clear audit log entry (timestamped,
+      with a confidence-broken-down explanation), allowing IT and
+      compliance to investigate without requiring the employee to do
+      anything
+
+  6.5 The system has known, documented failure modes and limitations,
+      and degrades gracefully under attack (it should never silently
+      pass an attack OR silently lock out a legitimate user)
+
+
+================================================================================
+7. CONSTRAINTS
+================================================================================
+
+Deployment constraints that any solution must accept:
+
+  7.1 Standard hardware only
+      Webcam, CPU, RGB only. No assumption of IR camera, depth sensor,
+      external attachments, or USB peripherals.
+
+  7.2 Standard operating system
+      Windows 10 / 11 on a corporate laptop. No admin-level installation
+      that would require IT to whitelist every machine.
+
+  7.3 No interruption to employee workflow
+      Cannot prompt the user to do anything during verification. No
+      "blink now", no "turn your head", no "click to confirm". The app
+      must be invisible to the employee unless an attack is detected.
+
+  7.4 No network dependency at runtime
+      Frames and biometric data must not leave the laptop. Model weights
+      may download on first install, but the verification loop must
+      work offline.
+
+  7.5 Reasonable resource budget
+      The laptop must remain usable for Teams calls, browsers, IDEs.
+      Continuous CPU usage above ~10% in idle state is too much. Memory
+      footprint should stay below ~1 GB.
+
+  7.6 Acceptable failure modes
+      False positives (locking out a legitimate user) and false negatives
+      (allowing an attack) are both bad, but in this product:
+        - False positives must be rare and recoverable. A locked-out
+          legitimate user files a help-desk ticket; this must not be
+          a daily occurrence.
+        - False negatives must be reduced as far as practical, with
+          remaining gaps openly documented and accepted as the cost of
+          a software-only solution.
+
+  7.7 Reproducible deployment
+      The same .exe must work on a freshly-imaged Infosys laptop
+      without per-machine tuning. Calibration variations (skin tone,
+      lighting, webcam model) must be handled by the software, not by
+      IT during install.
+
+
+================================================================================
+8. SUCCESS CRITERIA
+================================================================================
+
+The solution will be considered successful when:
+
+  8.1 Daily false-positive rate on real employees is below 1 per shift
+      (i.e., an employee on an 8-hour day sees at most 1 false alert)
+
+  8.2 Photo / printed-image attacks fail in 100% of test cases
+
+  8.3 Phone-screen video replay attacks fail in at least 90% of test
+      cases, across 3 different office lighting conditions
+
+  8.4 Deepfake replay attacks fail in at least 60% of test cases against
+      a representative consumer-grade deepfake (no claim made against
+      research-frontier deepfakes)
+
+  8.5 No employee complaint of perceptible system slowdown caused by
+      TruePixel during normal video-call usage
+
+  8.6 The .exe installs cleanly on a freshly-imaged Infosys laptop in
+      under 10 minutes with no IT intervention
+
+  8.7 All detection events are logged locally with sufficient detail for
+      a compliance officer to reconstruct what was seen and why a verdict
+      was reached, without any frames being stored
+
+
+================================================================================
+9. OUT OF SCOPE (KNOWN LIMITS — INTENTIONAL)
+================================================================================
+
+The following are NOT goals of this build. Listed so they cannot be
+assumed and then later treated as failures:
+
+  9.1 Defence against 3D-printed face masks
+      Requires depth-sensing hardware not present on laptops.
+
+  9.2 Defence against high-quality research-grade deepfakes with
+      synthetic blood-flow simulation
+      Open research problem; even commercial systems do not solve it.
+
+  9.3 Defence against identical twins or convincing siblings
+      Without a second factor (voice, badge, password), this is not
+      solvable with face biometrics alone.
+
+  9.4 Defence against USB-level camera-feed injection
+      A malicious driver can replace the camera output entirely. Software
+      cannot detect this from inside the same machine.
+
+  9.5 Defence against coercion or under-duress impersonation
+      No anti-coercion signal exists in software. Out of scope unless
+      paired with a separate workflow (panic-word, dual-approval).
+
+  9.6 Defence when the employee is wearing sunglasses or a face covering
+      Blink and EAR signals are blocked; face match degrades. The system
+      will refuse to verify rather than guess.
+
+  9.7 General real-time deepfake detection on arbitrary video streams
+      TruePixel verifies one specific enrolled identity per laptop. It is
+      not a generic deepfake-detection product.
+
+
+================================================================================
+10. ROADMAP — PROTOTYPE TODAY VS PRODUCT WITH RESOURCES
+================================================================================
+
+This section is for the leadership / jury pitch. Be explicit about what
+TruePixel IS today and what it can BECOME with investment.
+
+10.1 What TruePixel IS today (working prototype)
+    - End-to-end working desktop application running on a real Infosys
+      laptop
+    - Uses PRE-TRAINED, off-the-shelf computer vision models:
+        * Facenet512 (DeepFace) for face identity verification
+        * MediaPipe Face Mesh (Google) for facial landmark detection
+        * POS algorithm (Wang et al. 2017) for heart-rate signal extraction
+        * EAR algorithm (Soukupova & Cech 2016) for blink detection
+        * NLMS adaptive filter (classic DSP) for fluorescent flicker removal
+        * Custom multi-signal liveness aggregation built on top
+    - Architecture proven: identity + multi-signal liveness fused into
+      a single composite verdict, with 60+ unit tests covering every
+      detector and integration point
+    - Real-world validation: prototype tested on actual office lighting,
+      with measured false-positive and false-negative rates documented
+    - Demonstrates the core thesis: software-only continuous identity
+      and liveness verification IS achievable on standard enterprise
+      hardware
+
+10.2 What TruePixel CAN BECOME (with resources for training)
+    The prototype's limits come from using GENERIC pre-trained models
+    that were trained on public datasets from other contexts. With the
+    following investments, TruePixel becomes a defensible product:
+
+    A. Dataset collection (500-2000 Infosys employees, 1 quarter)
+        - Diverse skin-tone coverage (Fitzpatrick I-VI), gender,
+          age, accessory variations (glasses, earphones, beard)
+        - Real-world office and home-office lighting captured directly,
+          not simulated
+        - Genuine vs spoof samples covering photo, screen replay, mask,
+          and deepfake attack classes
+        - Consent and data-handling under DPDP Act 2023 framework
+
+    B. Custom model training (1 ML engineer, 1 quarter)
+        - Replace pre-trained Facenet with an Infosys-fine-tuned face
+          identity model trained on the captured employee dataset
+        - Train a dedicated spatial anti-spoofing model (MiniFASNetV2
+          or comparable) on the captured spoof set instead of relying
+          on synthetic Moire augmentation
+        - Tune the rPPG, blink, and liveness detectors against ground-
+          truth labels rather than published thresholds
+
+    C. Deployment readiness (1 IT/security engineer, ~6 weeks)
+        - PyInstaller .exe bundling with all model weights embedded
+        - IT-managed silent deployment to employee laptops
+        - Encrypted local audit log integration with Infosys SIEM
+        - Driver-level camera-injection defence using OS Media
+          Foundation enumeration + frame-jitter analysis
+
+10.3 Expected impact of investment
+    Today (prototype):       Catches obvious attacks (photos, zero-blink
+                             deepfakes, low-quality replays). Marginal
+                             on sophisticated phone-screen replays in
+                             fluorescent office lighting.
+
+    With investment above:   Production-grade accuracy aligned to
+                             Infosys-specific deployment conditions.
+                             Expected to be within 1-2% of best-in-
+                             class commercial anti-spoofing systems —
+                             which require IR depth hardware that
+                             Infosys laptops do not have.
+
+10.4 Honest framing for the jury / leadership
+    TruePixel is NOT a finished product today. It is a credible
+    working demonstration that the problem can be solved with software
+    alone on standard hardware. The hard part — the architecture, the
+    multi-signal fusion, the algorithm selection, the threat-model
+    discipline — is built and tested. What remains is the part every
+    serious AI/ML product needs: a custom training pipeline, an
+    Infosys-specific dataset, and the engineering polish for a
+    production rollout.
+
+    The decision in front of leadership is not "does this approach
+    work" (it does — see the demo) but "is this approach worth
+    investing in" (we believe yes — see the cost/benefit analysis
+    in Section 3).
+
+
+================================================================================
+11. SUMMARY
+================================================================================
+
+Infosys video calls assume identity. Software cannot currently verify it
+on standard employee laptops. Imposters can join calls, extract client
+material, fraudulently obtain credentials, and abuse verbally-granted
+approvals — with no signal that anything is wrong.
+
+TruePixel is the software-only, passive, real-time identity-and-liveness
+verification layer that closes this gap. It runs silently in the
+background while employees work, continuously checks that the live face
+on camera is the real enrolled employee, and produces an auditable trail
+of every check.
+
+It accepts that some attacks (3D masks, top-tier deepfakes, identical
+twins, driver-level injection) are beyond what a software-only RGB-only
+solution can defeat. The remaining envelope — replay attacks, photos,
+consumer deepfakes — is large, common, and worth defending against.
+
+================================================================================
+END OF PROBLEM STATEMENT
+================================================================================

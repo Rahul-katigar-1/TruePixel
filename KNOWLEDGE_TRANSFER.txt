@@ -1,0 +1,816 @@
+================================================================================
+TRUEPIXEL — KNOWLEDGE TRANSFER DOCUMENT
+================================================================================
+
+A complete walkthrough of the TruePixel project: what it does, why it exists,
+how it works, what's been built so far, what's known broken, and how to
+continue from here.
+
+Read this end-to-end before touching code. It is the source-of-truth document
+for anyone joining the project. Companion document: PROGRESS.md (shorter,
+chronological session-by-session log).
+
+Last major update: this document supersedes PROGRESS.md as the primary KT
+artefact.
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+TruePixel is a silent, real-time identity verification and deepfake detection
+desktop application written in Python. It runs in the background while an
+employee is on a video call (Microsoft Teams, Zoom, etc.) and periodically
+verifies that the person on camera is the real enrolled user — not a video
+replay attack, photo, or sophisticated deepfake.
+
+Built for Infosys employee laptops. Goal: pitch to leadership first, then
+deploy as a Windows .exe to actual employees.
+
+Core insight: identity (who) is necessary but not sufficient. A photo or video
+replay also shows the right identity. We layer multiple LIVENESS signals on
+top of identity matching, including physiological (heartbeat via rPPG),
+behavioural (blinking, micro-movements), and spatial (face vs background
+correlation). A composite score gates verification.
+
+Current state: 35/35 unit tests pass. Real-world replay defence is empirically
+marginal (best implementation achieves ~23% false-positive rate on real users
+and ~44% false-negative rate on phone-screen replays). Multi-signal liveness
+expansion is the current direction to improve those numbers.
+
+
+================================================================================
+2. THE PROBLEM
+================================================================================
+
+Original problem statement, expanded:
+
+Infosys employees join video calls daily. There is no real-time mechanism to
+verify that the person visible on camera is actually the employee — not:
+  - A pre-recorded video of them being played on a phone screen
+  - A photo printed or shown on a tablet
+  - An AI-generated deepfake driven by a different person's audio
+  - A coerced person being substituted in
+  - An identity twin / look-alike
+
+The cost of failed identity verification at Infosys: information leak,
+unauthorised access to client material, fraudulent attendance, credential
+abuse. Existing solutions (e.g. Microsoft Hello Face) require IR depth
+hardware not present on most employee laptops. We need a software-only
+solution that works on standard webcams.
+
+Deployment target: Windows laptops (1920x1080 typical, fluorescent or window
+lighting typical). Employee workflow must be uninterrupted — NO active
+challenges ("blink now", "turn left"), NO popups, NO clicks. The app must
+run silently in the background.
+
+
+================================================================================
+3. DEPLOYMENT CONTEXT
+================================================================================
+
+Audience for this build:
+  - Infosys leadership demo (first milestone)
+  - Then rollout to actual employees on production laptops
+
+User profile during development: Rahul (Infosys employee), working in an
+office with both fluorescent overhead lighting and windows. This environment
+is challenging for rPPG (the lighting is mixed and bright) and was the source
+of much painful real-world calibration.
+
+Packaging:
+  - Python 3.11.9 dependency, pinned via requirements.txt
+  - PyInstaller bundle target — single-folder Windows .exe
+  - First-run downloads Facenet model weights (~92 MB) from GitHub.
+    On corporate-VPN networks this download has historically been
+    blocked or rate-limited (~14 minutes on first run).
+
+Privacy posture:
+  - No frames or biometric data leave the laptop
+  - Enrolment photos and embeddings stored in data/enrolled/<name>/ locally
+  - No telemetry to a server
+
+Architecture posture:
+  - Three independent detector classes that can be calibrated, replaced, or
+    augmented without touching each other
+  - Single source of truth for tunable constants (config.py)
+  - Composite scoring with documented attack-surface analysis for each weight
+
+================================================================================
+4. ARCHITECTURE
+================================================================================
+
+The pipeline runs three parallel concerns:
+
+    Camera (webcam, background thread, continuous)
+        |
+        +-- FaceMesh overlay (every frame, lightweight)
+        |       +-- Dashboard live feed
+        |
+        +-- VerificationScheduler (background thread)
+                |
+                +-- Wait for next check interval
+                |     TEST_MODE: every 10 seconds
+                |     PRODUCTION: 2min -> 5min -> 10min -> 15-20min random
+                |
+                +-- BURST CAPTURE (8 seconds, 15 fps, ~120 frames)
+                        |
+                        +-- FaceMatcher (every 5th frame):
+                        |     DeepFace + Facenet/Facenet512 embeddings
+                        |     Multi-pose enrolment matching
+                        |     -> face_confidence (0.0-1.0)
+                        |
+                        +-- BlinkDetector (every frame):
+                        |     EAR algorithm
+                        |     Plus: iris pos, nose pos, mouth shape tracking
+                        |     -> blink rate, EAR variance, micro-movement metrics
+                        |
+                        +-- RPPGDetector (every frame):
+                        |     Green-channel forehead ROI
+                        |     + 4 face-adjacent BG patches
+                        |     -> heart rate (BPM) via Butterworth + FFT
+                        |     -> signal_quality (peak/total power ratio)
+                        |     -> spectral_replay_suspected (PPGSecure-inspired)
+                        |     -> background_correlation (legacy Pearson, diagnostic)
+                        |
+                        +-- Composite scoring:
+                              composite = round(
+                                face_conf * 0.50
+                              + blink_score * 0.30
+                              + max(0, rPPG_quality - NOISE_FLOOR) * 0.20,
+                                4
+                              )
+                              |
+                              +-- if spectral_replay_suspected AND frames >= 60
+                              |     -> force FAIL ("Replay attack suspected")
+                              +-- if composite >= 0.70 -> PASS (VERIFIED)
+                              +-- else -> FAIL (alert only on 2 consecutive fails)
+
+
+Pipeline characteristics:
+  - Camera runs continuously, never blocks the UI
+  - Face mesh overlay is cheap, runs every frame to make the live feed feel real
+  - Heavy detectors only run during burst capture (every 10s in test, every
+    5-20m in production)
+  - Burst capture grabs frames into a list, then detectors run sequentially
+  - Single PASS/FAIL verdict per burst, not per frame
+  - Consecutive-fail rule: a single fail is normal (user glanced at phone),
+    only escalate to user-visible ALERT after 2 consecutive fails
+
+
+================================================================================
+5. COMPONENTS IN DETAIL
+================================================================================
+
+5.1 core/camera.py — webcam I/O
+    Threaded webcam wrapper. Camera.start() opens cv2.VideoCapture, spawns
+    a background thread that continuously reads frames into self._frame
+    (protected by self._lock). Camera.get_frame() returns a copy of the
+    latest frame from any caller. Camera.stop() releases the device cleanly.
+
+    Designed so the UI and the scheduler never block on camera reads.
+
+
+5.2 core/face_mesh.py — MediaPipe wrapper
+    Wraps mediapipe.solutions.face_mesh.FaceMesh. Each frame returns:
+      - 468 facial landmarks as a list of (x, y) pixel tuples
+      - An annotated frame with mesh drawn for the dashboard
+
+    IMPORTANT VERSION CONSTRAINT: file has a top-level assertion that
+    mediapipe.__version__ <= "0.10.21". Newer mediapipe removed the
+    mp.solutions.* namespace this code uses. If pip ever upgrades mediapipe,
+    that assert fires immediately and the app refuses to start. Pinning is
+    enforced in requirements.txt at mediapipe==0.10.9.
+
+
+5.3 core/face_matcher.py — identity verification (DeepFace + Facenet)
+    Pre-loads the configured DeepFace model at startup (warm-up). Two stages:
+
+    ENROLMENT:
+      - Takes 6 pose/condition-varied photos (NOT 3; lesson learned from
+        deployment — single-pose enrolment dropped cosine similarity by
+        0.20+ when the user was backlit or slouched)
+      - Each photo's embedding is stored separately (NOT averaged) in
+        data/enrolled/<name>/embeddings.npy as an (N, embed_dim) matrix
+      - Photos saved alongside as photo_1.jpg .. photo_6.jpg
+      - Backward-compatible with legacy single-vector embedding.npy
+
+    MATCHING:
+      - On a live frame, extract one embedding via the same DeepFace model
+      - Compute cosine similarity against EACH enrolled embedding
+      - Take the MEAN (not MAX) — MEAN prevents a stranger who happens to
+        match ONE enrolled pose from scoring high
+      - Compare against config.FACE_MATCH_THRESHOLD
+
+    MODEL SWAP SUPPORT:
+      - config.FACE_RECOGNITION_MODEL controls which DeepFace model to use
+        (e.g. "Facenet" 128-dim or "Facenet512" 512-dim)
+      - config.FACE_EMBEDDING_DIM declares the expected dimension
+      - On startup, if saved embeddings don't match the current model's
+        dimension, _re_extract_embeddings_from_photos() runs the new
+        model over the saved enrolment JPEGs and overwrites the .npy
+        files. User does NOT have to re-enrol manually after a model swap.
+
+
+5.4 core/blink_detector.py — EAR + multi-signal liveness
+    Two responsibilities:
+
+    BLINK DETECTION (original):
+      - 6 landmarks per eye -> Eye Aspect Ratio formula
+      - When EAR drops below EAR_THRESHOLD for BLINK_CONSEC_FRAMES,
+        a blink is confirmed
+      - Maintains a rolling 60-second deque of blink timestamps
+      - Burst-scoped count tracked separately
+
+    MULTI-SIGNAL LIVENESS (expanded):
+      Designed because a static photo has every behavioural signal == 0,
+      but a real human always has at least one. Currently tracks:
+        - Burst blink count (from EAR)
+        - EAR variance across the burst (eye micro-movements)
+        - Iris-center position trajectory (gaze drift)
+        - Nose-tip position trajectory (head sway)
+        - Mouth height / width over time (subtle expression changes)
+
+      compute_liveness_score() aggregates these into a single 0.0-1.0
+      score. A static photo: all five signals near zero. A live person:
+      at least 2-3 of them registering activity.
+
+      All buffers cleared per burst via reset().
+
+    Requires the following landmark indices from config.py:
+      - LEFT_EYE_INDICES, RIGHT_EYE_INDICES (6 each)
+      - IRIS_LEFT_CENTER (iris tracking from refined landmarks)
+      - NOSE_TIP_LANDMARK
+      - MOUTH_TOP_LIP_CENTER, MOUTH_BOTTOM_LIP_CENTER,
+        MOUTH_LEFT_CORNER, MOUTH_RIGHT_CORNER
+
+
+5.5 core/rppg_detector.py — heartbeat + replay defence
+    Three concerns folded into one detector:
+
+    HEARTBEAT (rPPG, Wang et al. MIT 2016):
+      - Forehead ROI from FOREHEAD_LANDMARKS
+      - Mean green-channel value per frame -> rolling 8s buffer
+      - 3rd-order Butterworth bandpass filter 0.75-2.5 Hz (45-150 BPM)
+      - FFT, find dominant frequency in band -> BPM
+      - signal_quality = peak power / total band power (0.0-1.0)
+
+    REPLAY DEFENCE (PPGSecure-inspired, Nowara et al. IEEE FG 2017):
+      - Samples 4 patches ADJACENT to face bounding box (top/bottom/left/right)
+      - Each patch gets its own rolling green-channel buffer
+      - PRIMARY check: is_spectral_replay_suspected()
+          * Band-limited FFT of face buffer
+          * Same for each BG patch
+          * Replay flagged if any BG patch has a peak within
+            REPLAY_SPECTRAL_FREQ_TOLERANCE_HZ of the face peak,
+            AND with power >= REPLAY_SPECTRAL_MIN_POWER_RATIO of face peak
+      - SECONDARY (deprecated, diagnostic only):
+          compute_face_background_correlation() — legacy MAX-over-patches
+          Pearson correlation. Threshold set to 0.99 = effectively disabled.
+          Kept for log diagnostics.
+
+    BUFFER MANAGEMENT:
+      - All buffers (green forehead + 4 BG patches) cleared on reset()
+        which is called at the start of each burst
+      - This prevents bursts from contaminating each other
+
+    LIVE VISUALISATION:
+      - start_live_graph(camera, face_mesh) opens a separate matplotlib
+        window for validation against a phone health app
+      - RPPGGraphPanel in dashboard embeds the same view inline
+
+
+5.6 core/burst_capture.py — windowed frame collection
+    Simple helper. BurstCapture.capture() reads frames at target_fps for
+    duration_seconds and returns the list. Used by the scheduler at each
+    verification cycle.
+
+
+5.7 core/verification_scheduler.py — orchestration + composite scoring
+    The brain. Holds a reference to all 5 detectors. Public API:
+      - on_check_complete(callback): fires after every check
+      - on_alert(callback): fires only on 2 consecutive failed checks
+      - on_burst_start(callback): UI hint that burst is running
+      - start() / stop()
+      - time_until_next_check()
+
+    Internal scheduling loop wakes every 5 seconds. When the next-check
+    time has passed, _run_check() executes:
+      1. Notify UI burst is starting
+      2. Reset blink_detector + rppg_detector buffers
+      3. burst_capture.capture() -> list of frames
+      4. For each frame: run face_mesh, face_matcher (every 5th), blink, rPPG
+      5. Aggregate: average face confidence, extrapolate blink count to
+         per-minute rate, take LAST rPPG result (FFT improves as buffer fills)
+      6. Compute composite score with noise-floor clamp on rPPG
+      7. Check spectral replay flag — overrides PASS
+      8. Build CheckResult dataclass, fire callbacks
+      9. Advance to next phase, schedule next check
+
+    Composite formula:
+      composite = round(
+        face_conf * FACE_MATCH_WEIGHT +     # 0.50
+        blink_score * BLINK_WEIGHT +         # 0.30
+        max(0, rPPG_quality - NOISE_FLOOR) * HEARTBEAT_WEIGHT,   # 0.20
+        4
+      )
+
+    Composite passes if composite >= COMPOSITE_ALERT_THRESHOLD (0.70).
+    BUT if spectral_replay_suspected is True with >= 60 frames captured,
+    passed is forced to False and the alert_reason explains why.
+
+
+5.8 ui/dashboard.py — Tkinter window
+    Two-section layout:
+      TOP (1100x520):
+        - Left: live video feed (640x480) with face mesh overlay
+        - Right: status panels (Identity, Confidence, Blink rate, EAR,
+          Heart rate, Signal quality, Event Log)
+      BOTTOM (1100x480):
+        - Embedded 3-panel matplotlib rPPG live signal graph
+          (raw green, bandpass filtered, BPM scatter over time)
+
+    Methods are thread-safe via root.after(0, ...) dispatch:
+      - update_frame(frame)
+      - update_status(data)
+      - update_rppg_graph(detector)
+      - show_alert(message) / clear_alert()
+      - show_burst_indicator(active)
+      - update_countdown(seconds)
+
+
+5.9 ui/components.py — reusable widgets
+    - StatusIndicator: big VERIFIED / ALERT / INITIALIZING label
+      with wraplength so long messages don't clip
+    - MetricRow: label + colour-coded value pair
+    - LogPanel: scrollable Text widget with timestamped entries
+    - RPPGGraphPanel: FigureCanvasTkAgg-embedded matplotlib panel
+
+
+5.10 core/logger_setup.py — UTF-8 logging
+    Centralised logging. Writes to BOTH console AND a rotating file at
+    logs/truepixel_YYYYMMDD.log. The console handler wraps sys.stderr.buffer
+    in a UTF-8 io.TextIOWrapper because Windows PowerShell defaults to cp1252
+    which can't encode characters like ✓ ✗ that we use in log messages.
+    Without this wrap, Python's logging.StreamHandler would raise
+    UnicodeEncodeError mid-log.
+
+
+================================================================================
+6. DEPENDENCY STACK (FULLY PINNED)
+================================================================================
+
+Python 3.11.9 (installed via winget). Hard constraint — 3.12+ breaks mediapipe
+and tensorflow, 3.10 has fewer pre-built wheels.
+
+requirements.txt (all pinned, no ranges):
+
+  Core CV / ML:
+    opencv-python==4.8.1.78
+    mediapipe==0.10.9        (CRITICAL: must stay <= 0.10.21)
+    tensorflow==2.13.1
+    tensorflow-intel==2.13.1
+    deepface==0.0.79
+    numpy==1.24.3            (CRITICAL: TF 2.13 needs numpy<=1.24.3)
+    protobuf==3.20.3
+    scipy==1.11.4
+    matplotlib==3.7.5
+    Pillow==10.2.0
+
+  DeepFace transitive:
+    retina-face==0.0.17
+    fire==0.5.0
+    gdown==4.7.3
+    tqdm==4.66.4
+    pandas==2.0.3
+    requests==2.31.0
+
+  Packaging:
+    pyinstaller==6.3.0
+
+requirements-dev.txt:
+    pytest==7.4.4
+    pytest-mock==3.12.0
+
+Installation must be one-shot:
+    pip install -r requirements.txt
+NEVER one-at-a-time. One-at-a-time installs allow transitive dependencies to
+drift and we burned 5+ hours debugging that on Day 1.
+
+To verify environment:
+    python scripts/verify_env.py
+Should print: Result: 9/9 passed. Environment is clean.
+
+
+================================================================================
+7. DEVELOPMENT HISTORY
+================================================================================
+
+7.1 Day 1 — scaffold and dependency hell (~5 hours)
+    - Built skeleton project + stub detectors
+    - Solved mediapipe API removal (0.10.9 pin)
+    - Solved TF 2.21 protobuf 6 vs mediapipe protobuf 3 conflict (TF 2.13.1)
+    - Solved deepface needing tf-keras shim (avoided by staying on TF 2.13)
+    - Solved numpy 1.24.4 violating TF 2.13's <=1.24.3 (fixed to 1.24.3)
+    - Established the one-shot install method
+    - Built scripts/verify_env.py for portable sanity checks
+
+7.2 Day 2 — blink detector
+    - EAR algorithm per Soukupova & Cech 2016
+    - Calibrated for screen-work deployment context:
+        Medical lit: focused screen work = 5-10 blinks/min
+        Default human resting = 15-20 blinks/min
+        Range adopted: 5-30/min full credit, 2+ minimal credit, <2 fail
+    - Bugs caught:
+        BlinkDetector.reset() was never wired into the scheduler
+        Per-frame blink_rate was being averaged across the burst
+          instead of being an extrapolated per-minute count
+        Division-by-zero on BURST_DURATION_SECONDS
+
+7.3 Day 3 — rPPG heartbeat detection
+    - Wang et al. MIT 2016 rPPG algorithm
+    - Forehead ROI -> green channel mean -> Butterworth bandpass -> FFT
+    - Bug caught: RPPG_SAMPLE_RATE was 30 (from Day 1 before burst mode
+      existed). Buffer expected 240 samples but burst delivered only 120
+      at 15 fps -> 50% fill -> FFT never executed.
+      Fix: RPPG_SAMPLE_RATE = BURST_FPS = 15.
+      Added a coupling integration test to lock the invariant.
+    - Live signal graph embedded in dashboard
+
+7.4 Composite weight rebalance for office lighting
+    - Original equal weights (0.40 / 0.30 / 0.30) couldn't push composite
+      over 0.70 with low rPPG (real-world quality 0.10-0.16 in mixed office)
+    - Rebalanced to 0.50 / 0.30 / 0.20
+    - Attack-surface analysis comments added to config.py
+
+7.5 Video replay attack discovery (CRITICAL FINDING)
+    - User-discovered attack: held phone playing video of themselves in
+      front of webcam. System VERIFIED them at composite 0.72.
+    - This is the canonical real-world attack against face biometric
+      systems. We had no defence.
+    - Two defences added:
+        a) rPPG_NOISE_FLOOR = 0.15 (later 0.12): rppg_contribution =
+           max(0.0, quality - NOISE_FLOOR). Phone screen artefacts in
+           range 0.10-0.15 contribute zero.
+        b) face-bg correlation check (PPGSecure-inspired)
+
+7.6 Replay defence calibration attempts (the hard part)
+    Multiple attempts to make face-background correlation work in real
+    office conditions. All struggled because:
+      - Fluorescent lighting at 50/60 Hz aliases through CMOS rolling
+        shutter to produce correlated noise across face and BG regions
+      - Background human motion correlates spuriously with face signal
+      - Phone bezels and hands are mostly static in face-adjacent regions,
+        so phone replays don't always produce strong correlation
+      - rPPG signals are fundamentally low-SNR; small noise sources
+        dominate
+    Empirical results across attempts:
+      Single top-left ROI:           never triggered (always too flat)
+      Face-adjacent Pearson (Path B): 40% FP / 41% FN
+      FFT spectral peak (Path C):    23% FP / 44% FN
+    No rPPG-only replay defence reached production-grade reliability
+    in this office environment.
+
+7.7 Multi-pose enrolment expansion
+    - Single-pose / 3-photo enrolment was a studio-style clean baseline
+      that didn't survive real conditions:
+        Backlit by a window: cosine dropped 0.20+
+        Slumped posture: dropped another 0.10
+        Earphones: dropped another 0.05
+    - Expanded to 6 photos with intentional pose/condition variation
+    - Each photo's embedding stored SEPARATELY (not averaged)
+    - At match time: MEAN cosine across all enrolled poses (not MAX)
+    - Auto re-extraction when embedding dimension doesn't match current model
+
+7.8 Multi-signal liveness expansion
+    - Beyond just blinks. Static photos have all 5 signals = 0;
+      real humans have at least 2-3 active.
+    - BlinkDetector now also tracks:
+        EAR variance (eye micro-movements)
+        Iris center position trajectory (gaze drift)
+        Nose-tip position trajectory (head sway)
+        Mouth height / width over time (subtle expression changes)
+    - compute_liveness_score() aggregates into single 0.0-1.0
+
+
+================================================================================
+8. CURRENT STATE
+================================================================================
+
+Test suite:        35/35 PASS (run with: python tests/test_day1.py)
+Environment:       9/9 verify_env.py PASS
+Replay defence:    Path C (spectral) deployed. Marginal performance.
+                   23% FP / 44% FN per check. Consecutive-fail rule
+                   masks most of FP at user level.
+Multi-signal liveness: Buffers in place, compute_liveness_score()
+                   implemented. Not yet wired into composite scoring.
+Enrolment:         6-pose multi-photo system in place. Auto-re-extracts
+                   embeddings on model swap.
+Main loop:         Stable. Real-world tested across multiple sessions.
+                   Camera, face mesh, status panel, embedded rPPG graph
+                   all working.
+Demo readiness:    Architecture and most components demo-ready.
+                   Replay defence has known issues — see Section 11.
+
+
+================================================================================
+9. KEY CONFIG VALUES (config.py)
+================================================================================
+
+Timing:
+  TEST_MODE                   = True (10s intervals for dev/demo)
+  PRODUCTION: 2/5/10/15-20m phase ladder
+  BURST_DURATION_SECONDS      = 8
+  BURST_FPS                   = 15
+  RPPG_SAMPLE_RATE            = 15  (MUST equal BURST_FPS)
+
+rPPG:
+  RPPG_BUFFER_SECONDS         = 8
+  RPPG_LOW_FREQ               = 0.75 Hz  (45 BPM)
+  RPPG_HIGH_FREQ              = 2.5  Hz  (150 BPM)
+  RPPG_NOISE_FLOOR            = 0.12
+
+Composite scoring:
+  FACE_MATCH_WEIGHT           = 0.50
+  BLINK_WEIGHT                = 0.30
+  HEARTBEAT_WEIGHT            = 0.20
+  COMPOSITE_ALERT_THRESHOLD   = 0.70
+
+Replay defence (Path C):
+  REPLAY_ATTACK_CORRELATION_THRESHOLD = 0.99 (legacy Pearson, disabled)
+  REPLAY_SPECTRAL_FREQ_TOLERANCE_HZ   = 0.10
+  REPLAY_SPECTRAL_MIN_POWER_RATIO     = 0.20
+  REPLAY_BG_PATCH_PX                  = 40
+  REPLAY_BG_PATCH_OFFSET_PX           = 20
+  REPLAY_BG_PATCH_COUNT               = 4
+
+Face match:
+  FACE_MATCH_THRESHOLD       = 0.60 (cosine similarity)
+  FACE_RECOGNITION_MODEL     = e.g. "Facenet" or "Facenet512"
+  FACE_EMBEDDING_DIM         = 128 or 512 (must match model)
+  ENROLLMENT_PHOTO_COUNT     = 6
+
+Blink:
+  EAR_THRESHOLD              = 0.20
+  BLINK_CONSEC_FRAMES        = 2
+  LOW_BLINK_RATE_THRESHOLD   = 5
+
+Landmark indices (for multi-signal liveness):
+  IRIS_LEFT_CENTER, NOSE_TIP_LANDMARK,
+  MOUTH_TOP_LIP_CENTER, MOUTH_BOTTOM_LIP_CENTER,
+  MOUTH_LEFT_CORNER, MOUTH_RIGHT_CORNER
+
+UI:
+  WINDOW_WIDTH                = 1100
+  WINDOW_HEIGHT               = 1000
+  RPPG_GRAPH_PANEL_HEIGHT     = 280
+
+
+================================================================================
+10. TESTING STRATEGY
+================================================================================
+
+Run all tests: python tests/test_day1.py
+Expect: Results: 35/35 passed.
+
+Test categories:
+  - Environment sanity (9 tests):
+      Camera opens, MediaPipe works, DeepFace loads, all imports resolve,
+      config values present, dashboard importable, BurstCapture instantiates
+  - Scheduler logic (3 tests):
+      Phase transitions, TEST_MODE behaviour
+  - Blink detector (3 tests):
+      EAR formula on synthetic eyes (open vs closed), None-landmarks handling,
+      reset clears state
+  - rPPG detector unit (5 tests):
+      Instantiates empty, handles None gracefully, FFT detects 1.2Hz sine
+      as ~72 BPM, reset clears state, buffer fill ratio integration guard
+  - Scenario simulations (3 tests):
+      Video replay math, real user passes, photo attack fails
+  - Replay correlation legacy (3 tests):
+      High Pearson on identical signals, low on independent,
+      bg buffer clears on reset
+  - Face-adjacent patches (2 tests):
+      Geometry (4 patches outside face bbox), None-input handling
+  - Calibration assertions (2 tests):
+      Noise floor = 0.12, Pearson threshold = 0.99 (disabled)
+  - Path C spectral (6 tests):
+      Peak helper finds correct frequency, returns None for short signal,
+      replay True when BG matches face peak, replay False on different
+      frequency, replay False on empty BG buffers, replay False on flat
+      face signal
+
+Real-world validation is its own discipline:
+  - python main.py + sit normally + observe pass rate
+  - python main.py + hold phone playing video + observe FN rate
+  - python scripts/validate_rppg.py + open phone health app + compare BPM
+
+
+================================================================================
+11. KNOWN ISSUES AND LIMITATIONS
+================================================================================
+
+11.1 Replay defence is marginal in real-world office conditions
+    - Per-check false-positive rate: 23%
+    - Per-check false-negative rate: 44%
+    - Consecutive-fail rule (need 2 in a row) reduces user-visible
+      false alerts to ~5% under independence assumption
+    - But sustained replay attack can succeed by chance with non-trivial
+      probability
+    - Root cause: rPPG signals are inherently low-SNR; fluorescent
+      light flicker and CMOS rolling-shutter aliasing produce similar
+      statistical signatures to phone screen flicker
+    - Path forward (not yet implemented): LBP texture detection as
+      Layer 2 defence — completely independent signal that detects
+      the difference between skin (porous, textured) and screens
+      (uniform pixels)
+
+11.2 Real-world pass rate sensitivity to rPPG quality
+    - In mixed office lighting, rPPG signal_quality often drops below
+      0.15 noise floor for real users
+    - When clamped to 0, composite caps at face*0.50 + blink*0.30 = ~0.70
+    - User glances away or breathes irregularly -> rPPG drops more ->
+      composite falls just below threshold -> FAIL
+    - Tolerated by consecutive-fail rule, but not ideal UX
+    - Improvement candidates:
+        Move some weight from rPPG back to blink/face if rPPG repeatedly
+        below floor for this user (per-user calibration)
+        Add multi-signal liveness aggregation to composite (already
+        scaffolded in blink_detector.py, not yet wired in)
+
+11.3 Out-of-scope attacks (documented, not defended)
+    - 3D-printed mask: requires IR depth sensor (no hardware)
+    - High-quality deepfake with synthetic blood flow: research frontier
+    - Identical twin or convincing sibling: face match would pass both
+    - USB camera-feed injection: software cannot defend against drivers
+    - Coercion / under duress: no anti-coercion signal exists
+    - User wearing sunglasses or face mask: blink/EAR fail
+
+11.4 Demo readiness concerns
+    - Live "verify me" demo will sometimes false-fail due to issue 11.2
+    - Live "replay attack defence" demo will sometimes false-pass
+      due to issue 11.1
+    - Demo script should rely on architecture explanation + math walkthrough
+      more than live theatrics; reserve live demo for the photo attack
+      (which always fails correctly) and identity match (which works well)
+
+11.5 First-run network requirement
+    - DeepFace downloads ~92 MB Facenet weights from GitHub on first
+      use of FaceMatcher().enroll()
+    - Behind corporate VPN this can fail or be very slow
+    - Workaround: manually download facenet_weights.h5 from
+      https://github.com/serengil/deepface_models/releases
+      and place it in ~/.deepface/weights/
+
+11.6 Consecutive-fail counter does not cap
+    - Counter increments past 2 indefinitely on sustained failures
+    - Logs read "consecutive: 5/2", "6/2", etc. — the /2 is misleading
+    - Alert fires correctly (every check once >= 2), just log cosmetic
+
+
+================================================================================
+12. FUTURE WORK
+================================================================================
+
+In priority order for the next sessions:
+
+12.1 Wire multi-signal liveness into composite
+    The blink_detector.compute_liveness_score() already aggregates 5
+    signals (blinks, EAR variance, iris drift, head sway, mouth changes).
+    The scheduler does not yet read this score into the composite.
+    Adding it would:
+      - Strengthen photo defence (photos have zero on all signals)
+      - Strengthen replay defence (some recorded videos have static-ish
+        regions in non-face areas, reducing several scores)
+      - Reduce pressure on rPPG to carry the liveness burden alone
+
+12.2 LBP texture detection (Layer 2 replay defence)
+    Local Binary Patterns on a cheek skin patch. Real skin: high LBP
+    variance from pores/micro-features. Phone screens: near-zero LBP
+    variance at pixel level. Independent of rPPG. Independent of lighting.
+    Estimated cost: ~150-200 LOC + scikit-image dependency.
+    Reference impl: https://github.com/lbf4616/Face-Anti-spoofing
+
+12.3 Per-user calibration during enrolment
+    Currently every user gets the same NOISE_FLOOR, weights, thresholds.
+    In reality, different webcams + skin tones + lighting produce different
+    baseline rPPG quality. Run a 60-second baseline measurement during
+    enrolment, store per-user offsets, adjust thresholds at match time.
+
+12.4 PyInstaller .exe build
+    scripts/build_exe.py exists but has never been run. Expect surprises:
+    hidden imports, model file bundling, DLL packaging on Windows.
+    1-2 hour effort minimum.
+
+12.5 Cross-laptop reproducibility test
+    Only tested on one Windows laptop. Try on at least 3 different
+    employee laptops to validate environment + lighting calibration.
+
+12.6 Production-mode demo timing
+    Currently TEST_MODE = True for 10-second cycles. For leadership demo
+    need to either flip to False (first check 2 minutes) and pad the demo
+    or override INTERVAL_FIRST_CHECK_SECS temporarily.
+
+12.7 Cleanup
+    Consecutive-fail counter cap (or honest log message without the /2)
+    Remove deprecated single-pose enrolment code paths (or keep gated)
+    Delete old _bg_buffer references if any still linger
+
+
+================================================================================
+13. HOW TO RESUME (start-of-session checklist)
+================================================================================
+
+Step 1 — re-enter environment
+    cd C:\Users\Admin\Documents\Truepixel
+    venv\Scripts\Activate.ps1
+    python scripts\verify_env.py
+        Expect: Result: 9/9 passed.
+
+Step 2 — confirm logic
+    python tests\test_day1.py
+        Expect: Results: 35/35 passed.
+
+Step 3 — confirm app launches
+    python main.py
+    (Close after 1-2 cycles. Just looking for clean startup.)
+
+Step 4 — decide what to work on
+    Skim PROGRESS.md (chronological log of decisions)
+    Skim this file (KT — current architecture and known issues)
+    Pick from Section 12 or address a known issue from Section 11
+
+Step 5 — if collaborating with Master Claude
+    The architect/worker split:
+      - You (Rahul) drive the conversation
+      - Master Claude provides design decisions in copy-paste prompts
+      - Worker Claude (terminal/IDE) executes those prompts verbatim
+      - Worker flags any contradictions before applying
+    If you've lost the Master Claude chat, regenerate it using the
+    prompt in PROGRESS.md.
+
+
+================================================================================
+14. GLOSSARY
+================================================================================
+
+rPPG (remote photoplethysmography):
+    Detecting heart rate from subtle skin colour changes in video.
+    A real face has blood flow that subtly modulates green-channel
+    intensity at the heartbeat frequency. A photo or screen does not.
+
+EAR (Eye Aspect Ratio):
+    A geometric ratio of vertical to horizontal eye landmark distances.
+    Drops sharply (below ~0.20) during a blink. Used to count blinks.
+
+PPGSecure:
+    Anti-spoofing approach from Nowara et al. (IEEE FG 2017). Uses rPPG
+    signal extracted from both face and background regions. A real face
+    has pulse in face but not background; a phone replay has the screen's
+    pulsing affecting both. Comparing them distinguishes the two.
+
+LBP (Local Binary Pattern):
+    Texture descriptor that captures local pixel-level variation. Real
+    skin has high LBP variance (pores, hairs, micro-features); phone
+    screens have near-zero LBP variance (uniform pixels).
+
+Burst capture:
+    The 8-second window during which all heavy detectors run. Picked
+    because rPPG needs at least 8 seconds of frames to fill its FFT
+    buffer.
+
+Composite score:
+    Weighted sum of face_confidence, blink_score, and rPPG_contribution.
+    The single number that gates PASS/FAIL.
+
+Noise floor:
+    Minimum rPPG signal quality to count toward composite. Quality below
+    floor contributes zero (clamped at floor). Designed to reject phone
+    screen artefacts which sit in the 0.05-0.15 range.
+
+Face-adjacent patches:
+    4 small regions sampled immediately around the face bounding box
+    (top, bottom, left, right). Used for PPGSecure replay defence.
+
+Consecutive-fail rule:
+    A single failed check does not fire an ALERT to the user. Only
+    after 2 consecutive failures does the system alert. Masks transient
+    false positives from a glance away.
+
+Multi-pose enrolment:
+    Enrolment captures 6 photos with intentional pose/condition variation
+    (frontal, side, looking down, backlit, etc.). Each photo's embedding
+    is stored separately. Match uses MEAN cosine similarity across all
+    poses.
+
+TEST_MODE / PRODUCTION mode:
+    TEST_MODE = True runs verifications every 10 seconds for dev/demo.
+    PRODUCTION mode uses an adaptive 2/5/10/15-20-minute phase ladder.
+
+
+================================================================================
+END OF KT DOCUMENT
+================================================================================
+
+If anything in this document is wrong or outdated, fix it. This file is
+the source-of-truth artefact for the project. Keep it current.

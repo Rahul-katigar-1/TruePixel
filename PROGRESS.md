@@ -409,4 +409,69 @@ Mental model:
 
 ---
 
+---
+
+## Session: NLMS adaptive flicker cancellation + signal demotion
+
+Added two final pieces to the rPPG pipeline before the leadership demo.
+
+### What changed
+
+**1. `NLMSFilter` class** (`core/rppg_detector.py`) — Normalized Least-Mean-Squares
+adaptive filter, classic Widrow DSP. M=4 taps, mu=0.05, eps=1e-4. Parameters
+fixed in config.py after a multi-round verification pass against Gemini's
+literature claims (and one back-and-forth where I conceded a wrong call on
+filter length).
+
+**2. NLMS integration into `process()`** — Before bandpass + FFT, the chosen
+POS signal is run through NLMS with the BG-patch average as a noise
+reference. Cleans out fluorescent flicker (50/60 Hz mains, aliased through
+CMOS rolling shutter into the heart-rate band). NLMS resets on every burst.
+
+**3. `_compute_bg_reference_signal()`** — Averages the 4 face-adjacent BG
+patches into a single 1-D reference, length-aligned to the primary POS
+signal. Pads with mean if BG buffer shorter than POS buffer.
+
+**4. `_is_ambient_aliasing_active()`** — Bandpass-filters the BG reference,
+FFT, and tests whether peak power holds > `SIGNAL_DEMOTION_BG_PEAK_RATIO`
+(0.50) of total band power. If true, fluorescent flicker is overwhelming
+the camera and rPPG cannot be trusted.
+
+**5. Scheduler demotion** (`core/verification_scheduler.py`) — When
+`ambient_aliasing` is True for the burst, the rPPG signal_quality is
+forced to 0 before composite scoring. Composite then leans on face + blink
+only. Logged so we can see it in the event log.
+
+**6. Six new tests** covering NLMS convergence on shared noise, NLMS
+passthrough when reference is zero, NLMS reset, ambient aliasing detection
+on dominant peak, ambient aliasing NOT detected on broadband noise, and
+the `ambient_aliasing` flag exposure in `_result()`.
+
+### Test results
+
+**63/63 PASS** — the test suite has grown substantially (was 35 last
+session; the rest came from POS/dual-ROI/texture/liveness-aggregation work
+that landed between sessions).
+
+### Empirical hypothesis to test in next session
+
+LMS + signal demotion should reduce the 23% FP / 44% FN rates from the
+spectral-replay session by:
+1. Stripping fluorescent flicker before it reaches the FFT → fewer spurious
+   correlations between face and BG → fewer false-positive replay flags
+2. Demoting rPPG to 0 when BG is dominated by aliased flicker → graceful
+   degradation instead of false signal
+3. Cleaner POS signal → more real-user bursts crossing the noise floor →
+   higher real-world pass rate
+
+### Documentation updates
+
+PROBLEM_STATEMENT.txt now has a Section 10 "Roadmap — Prototype Today vs
+Product With Resources" laying out what TruePixel IS today (working
+prototype with pre-trained models) and what it can BECOME with investment
+(custom dataset + Infosys-specific trained models + production engineering).
+This section is the pitch-doc framing for leadership: the architecture and
+algorithm work is done, what's left is the kind of investment any serious
+AI/ML product needs.
+
 End of progress log. See you tomorrow.

@@ -64,6 +64,12 @@ class CheckResult:
     lbp_variance:           float = 0.0
     texture_screen_suspected: bool = False
     alert_reason:           Optional[str] = None
+    # ── Face presence (MediaPipe authoritative) ─────────────────────────
+    # face_present=False means MediaPipe didn't detect a face in enough of
+    # the burst frames — user stepped away, glanced down, etc. This is a
+    # NO_FACE state, NOT a verification failure or a security event.
+    face_present:           bool  = True
+    face_present_ratio:     float = 1.0   # fraction of burst frames with a face
     # Representative frame from the burst — captured so the dev-feedback UI
     # can show the developer exactly which image is being labelled. Excluded
     # from repr/compare because numpy arrays don't compare cleanly and the
@@ -72,10 +78,12 @@ class CheckResult:
 
     def short_failure_reason(self) -> str:
         """
-        Categorical, user-facing failure reason. Priority: replay > identity
-        > liveness > rPPG > generic-score. Shared by the dashboard status
-        banner and the main alert log to keep the wording consistent.
+        Categorical, user-facing failure reason. Priority: no-face > replay >
+        identity > liveness > rPPG > generic-score. Shared by the dashboard
+        status banner and the main alert log to keep the wording consistent.
         """
+        if not self.face_present:
+            return f"No face detected ({int(self.face_present_ratio * 100)}% of burst)"
         if self.texture_screen_suspected:
             return f"Phone screen detected (LBP {self.lbp_variance:.2f})"
         if self.face_confidence < config.FACE_MATCH_THRESHOLD:
@@ -179,17 +187,87 @@ class VerificationScheduler:
                 self._run_check()
             time.sleep(5.0)
 
+    def _face_present_now(self, num_samples: int = 3,
+                          inter_sample_delay_s: float = 0.15) -> bool:
+        """
+        Quick pre-burst presence check. Samples a few frames from the live
+        camera and asks MediaPipe whether ANY of them contains a face.
+
+        Returns True as soon as a single frame has a face — that's enough
+        evidence that a person is in front of the camera to justify the
+        expensive 8-second burst. Returns False if none of the sampled
+        frames contained a face, in which case the caller skips the burst.
+
+        ~0.5 seconds total cost (3 samples × ~150ms apart). Cheap enough
+        to run on every scheduled check.
+        """
+        for _ in range(num_samples):
+            frame = self.camera.get_frame()
+            if frame is not None:
+                landmarks, _ = self.face_mesh.process(frame)
+                if landmarks is not None:
+                    return True
+            time.sleep(inter_sample_delay_s)
+        return False
+
+    def _emit_no_face_check(self, reason: str, last_frame=None,
+                            face_present_ratio: float = 0.0):
+        """
+        Build and emit a NO_FACE CheckResult without running detectors.
+        Used by both the pre-burst presence check (face never visible) and
+        the post-burst safety net (face vanished mid-burst).
+        """
+        result = CheckResult(
+            check_number       = self._check_count,
+            timestamp          = time.time(),
+            phase              = self._phase,
+            face_confidence    = 0.0,
+            face_name          = "Unknown",
+            blink_rate         = 0.0,
+            ear                = 0.0,
+            signal_quality     = 0.0,
+            heart_rate         = 0.0,
+            composite_score    = 0.0,
+            passed             = False,
+            frames_captured    = 0,
+            face_present       = False,
+            face_present_ratio = face_present_ratio,
+            alert_reason       = reason,
+            last_frame         = last_frame,
+        )
+        logger.info(
+            f"Check #{self._check_count}: NO FACE — {reason}. "
+            f"Not counted as fail; no alert fired."
+        )
+        if self._on_check_complete:
+            self._on_check_complete(result)
+        self._advance_schedule()
+
     def _run_check(self):
         """
         Full verification check:
+          0. Quick pre-burst presence check — bail out cheaply if nobody
+             is in front of the camera (saves ~8 s of wasted detection
+             work AND prevents stale-frame verification bugs).
           1. Notify UI that burst is starting
           2. Capture 8 seconds of frames
           3. Run all 3 detectors across those frames
-          4. Average results, compute composite score
-          5. Advance schedule, fire callbacks
+          4. After-burst presence gate (catches user stepping away mid-burst)
+          5. Average results, compute composite score
+          6. Advance schedule, fire callbacks
         """
         self._check_count += 1
         logger.info(f"=== Verification check #{self._check_count} starting ===")
+
+        # ── Step 0: Pre-burst presence check ─────────────────────────────
+        # If no face is visible at the moment of the check, there's no
+        # point running the 8-second burst. Emit NO_FACE and wait for the
+        # next scheduled check — by then the user may be back.
+        if not self._face_present_now():
+            self._emit_no_face_check(
+                "No face visible at check time — burst skipped."
+            )
+            return
 
         if self._on_burst_start:
             self._on_burst_start()
@@ -212,36 +290,96 @@ class VerificationScheduler:
             return
 
         # Step 2: Run detectors across all burst frames
-        face_confidences  = []
-        face_matches      = []   # list of (name, confidence) tuples from each match call
-        burst_blink_count = 0    # blinks detected DURING this burst (not cumulative)
-        ears              = []   # EAR values from frames where a face was found
-        rppg              = None # holds last rPPG result — FFT improves as buffer fills
-        last_frame        = None # save the final frame+landmarks for texture analysis
-        last_landmarks    = None
+        face_confidences       = []
+        face_matches           = []   # list of (name, confidence) tuples from each match call
+        burst_blink_count      = 0    # blinks detected DURING this burst (not cumulative)
+        ears                   = []   # EAR values from frames where a face was found
+        rppg                   = None # holds last rPPG result — FFT improves as buffer fills
+        last_frame             = None # save the final frame+landmarks for texture analysis
+        last_landmarks         = None
+        frames_with_face       = 0    # MediaPipe-authoritative face presence counter
+        face_present_per_frame = []   # per-frame bool — used for the recent-window gate
 
         for i, frame in enumerate(frames):
             landmarks, _ = self.face_mesh.process(frame)
-            if landmarks is not None:
-                last_frame = frame
+            has_face = landmarks is not None
+            face_present_per_frame.append(has_face)
+
+            # MediaPipe is the SINGLE source of truth for "is there a face?".
+            # Without this gate, DeepFace's internal detector finds face-like
+            # patterns in chairs/walls and produces spurious high-confidence
+            # matches when the user has stepped away.
+            if has_face:
+                frames_with_face += 1
+                last_frame     = frame
                 last_landmarks = landmarks
 
-            # Face match — run on every 5th frame (slow operation)
-            if i % 5 == 0:
-                match = self.face_matcher.match(frame)
-                face_confidences.append(match["confidence"])
-                face_matches.append((match["name"], match["confidence"]))
+                # Face match every 5th face-present frame (slow operation).
+                # Counting against frames_with_face (not i) means we still get
+                # ~5–8 matches per burst even when the user is intermittently
+                # in frame, and we never match against face-less frames.
+                if frames_with_face % 5 == 1:
+                    match = self.face_matcher.match(frame)
+                    face_confidences.append(match["confidence"])
+                    face_matches.append((match["name"], match["confidence"]))
 
-            # Blink detection — run on every frame (fast)
+            # Blink detection — run on every frame (the detector handles None
+            # landmarks internally and contributes nothing to liveness signals
+            # for face-less frames, which is exactly what we want).
             blink = self.blink_det.process(landmarks)
             if blink["blink_detected"]:
                 burst_blink_count += 1
             if blink["ear"] > 0:
                 ears.append(blink["ear"])
 
-            # rPPG — feed every frame into the detector buffer (needs accumulation)
-            # FFT improves as the buffer fills, so we keep only the last result.
+            # rPPG — same pattern: detector handles None landmarks (returns
+            # "No signal") and skips its RGB buffer append in that case.
             rppg = self.rppg_det.process(frame, landmarks)
+
+        # ── SAFETY NET: post-burst NO_FACE gate ──────────────────────────
+        # The pre-burst presence check (step 0) already filtered the easy
+        # "nobody at the camera" case. This gate catches the trickier case
+        # where the user was in frame at check-start but stepped away
+        # during the 8s burst, OR was only briefly in frame.
+        #
+        # Two gates, BOTH must pass to proceed to a verdict:
+        #   - Overall: ≥ 60% of burst frames had a face (user mostly present)
+        #   - Recent : ≥ 80% of the LAST ~2s of frames had a face
+        #              (user present AT verdict time, not just at the start)
+        # The recent-window gate is what stops the "stepped away mid-burst,
+        # but the verdict still claims VERIFIED using old frames" bug.
+        total_frames = len(frames)
+        face_present_ratio = frames_with_face / float(total_frames)
+
+        recent_window_size = min(
+            int(config.RPPG_SAMPLE_RATE * 2),   # last ~2 seconds at burst fps
+            total_frames,
+        )
+        recent_window = face_present_per_frame[-recent_window_size:]
+        recent_face_ratio = (sum(recent_window) / float(len(recent_window))
+                             if recent_window else 0.0)
+
+        FACE_PRESENT_MIN_OVERALL = 0.60
+        FACE_PRESENT_MIN_RECENT  = 0.80
+
+        if (face_present_ratio < FACE_PRESENT_MIN_OVERALL or
+            recent_face_ratio  < FACE_PRESENT_MIN_RECENT):
+            # If the user vanished mid-burst, last_frame still points at an
+            # old face-present frame. Don't carry it through — the feedback
+            # panel would show a stale photo and confuse the operator.
+            stale_frame_carries_through = (
+                recent_face_ratio < FACE_PRESENT_MIN_RECENT
+            )
+            self._emit_no_face_check(
+                reason = (
+                    f"No face in {int((1.0 - face_present_ratio) * 100)}% of burst "
+                    f"({int(recent_face_ratio * 100)}% present in last 2s) — "
+                    f"user not in view."
+                ),
+                last_frame         = None if stale_frame_carries_through else last_frame,
+                face_present_ratio = face_present_ratio,
+            )
+            return
 
         # Step 3: Aggregate burst results
         avg_face_conf   = float(sum(face_confidences)  / len(face_confidences))  if face_confidences  else 0.0
@@ -254,9 +392,26 @@ class VerificationScheduler:
         # rPPG: use last result from burst — FFT improves as buffer fills.
         # Early frames return quality=0.0 (buffer not full).
         # Final frame has the most complete signal window.
-        last_rppg = rppg if rppg is not None else {"signal_quality": 0.0, "heart_rate": 0.0}
+        last_rppg = rppg if rppg is not None else {
+            "signal_quality": 0.0,
+            "heart_rate":     0.0,
+            "ambient_aliasing": False,
+        }
         final_signal_quality = last_rppg["signal_quality"]
         final_heart_rate     = last_rppg["heart_rate"]
+
+        # Signal demotion: when the BG itself is dominated by a heart-rate-band
+        # peak (fluorescent flicker aliasing overwhelming the camera), rPPG
+        # cannot be trusted for this burst. Zero its contribution to composite
+        # instead of emitting a false positive on the heartbeat signal. The
+        # composite then leans on face_match + blink_score only.
+        ambient_aliasing = bool(last_rppg.get("ambient_aliasing", False))
+        if ambient_aliasing:
+            logger.info(
+                f"Ambient aliasing detected in BG patches — demoting rPPG to 0 "
+                f"for this burst (raw quality was {final_signal_quality:.3f})."
+            )
+            final_signal_quality = 0.0
 
         # Pick the matched identity — name from the highest-confidence match in the burst
         if face_matches:
@@ -381,6 +536,8 @@ class VerificationScheduler:
             lbp_variance             = lbp_variance,
             texture_screen_suspected = texture_screen_suspected,
             alert_reason             = alert_reason,
+            face_present             = True,
+            face_present_ratio       = face_present_ratio,
             last_frame               = last_frame,
         )
 

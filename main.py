@@ -82,6 +82,22 @@ def main():
         # Hand the full CheckResult to the dashboard so the dev feedback panel
         # has every signal value available when the developer clicks Real/Fake.
         dashboard.notify_check_complete(result)
+
+        # NO FACE branch — user stepped out of frame. Update the status
+        # banner to NO FACE (amber, not red) so the operator sees the
+        # current state, but leave the metric panels alone so they keep
+        # their last verified values rather than zeroing out misleadingly.
+        if not result.face_present:
+            dashboard.show_no_face()
+            dashboard.log.add_entry(
+                f"Check #{result.check_number}: NO FACE — verification paused."
+            )
+            logger.info(
+                f"Check #{result.check_number}: NO FACE — banner updated, "
+                f"verdict skipped."
+            )
+            return
+
         dashboard.update_status({
             "face_name":        result.face_name,
             "face_confidence":  result.face_confidence,

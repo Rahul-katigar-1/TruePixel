@@ -7,3 +7,4 @@ data/enrolled/*/photo_*.jpg
 backup/*.mp4
 .DS_Store
 Thumbs.db
+.claude/

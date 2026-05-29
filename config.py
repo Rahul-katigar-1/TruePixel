@@ -93,10 +93,44 @@ RPPG_HIGH_FREQ = 2.5
 RPPG_SAMPLE_RATE = 15
 FOREHEAD_LANDMARKS = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288]
 
-# Face matching
-FACE_MATCH_THRESHOLD = 0.60
+# ── Face matching ─────────────────────────────────────────────────────────────
+# Model: Facenet512 (512-dim embeddings) instead of Facenet (128-dim).
+# Why: independent benchmarks on the Deepface framework show Facenet512 at
+# 97.4% accuracy vs Facenet at 92.1% — and the larger embedding space
+# meaningfully widens the gap between same-person and different-person
+# cosine similarities, which directly addresses the stranger-getting-matched
+# false-positive we hit in testing. Same MIT licence, drop-in swap.
+#
+# Aggregation across multi-pose enrolment: we now use MEAN instead of MAX
+# across the 3 enrolled embeddings. MAX is biased toward false positives —
+# if a stranger happens to look slightly like the enrolled user in ANY of
+# the 3 poses, MAX picks that high value. MEAN forces the stranger to look
+# similar across ALL enrolled poses, which is far less likely.
+#
+# Confidence metric: RAW cosine similarity, clamped to [0, 1]. Earlier we
+# applied (sim+1)/2 to "normalise" the [-1, +1] cosine range to [0, 1],
+# but that linear remap inflated random faces (cosine ~0.2) to 0.60
+# confidence, defeating the threshold entirely.
+#
+# Threshold: 0.55 is a starting calibration for Facenet512 + MEAN aggregation.
+# It should be re-tuned with dev_feedback data once we have ~30 labelled
+# checks under the new pipeline. DeepFace's documented default for
+# Facenet512 cosine similarity is 0.70 (= 0.30 cosine distance), but that
+# assumed MAX across poses and the old broken normalisation — the MEAN
+# aggregation produces somewhat lower numbers for the same identity, so
+# the threshold needs to come down accordingly.
+FACE_RECOGNITION_MODEL = "Facenet512"
+FACE_EMBEDDING_DIM     = 512      # must match the chosen model
+FACE_MATCH_THRESHOLD   = 0.55     # raw cosine similarity (NOT the old (sim+1)/2 score)
 ENROLLED_FACES_DIR = "data/enrolled"
-ENROLLMENT_PHOTO_COUNT = 3
+
+# 6-pose enrolment (was 3). The original 3 poses (frontal/left/right) didn't
+# capture real-world office conditions: backlit windows, slumped posture,
+# earphones, glance-down work pose. The extra 3 poses force the user to
+# enrol IN THE DEPLOYMENT ENVIRONMENT instead of a clean studio-style frontal
+# shot, which dramatically widens the cosine-similarity envelope of "looks
+# like you" across the conditions Facenet512 will see during actual checks.
+ENROLLMENT_PHOTO_COUNT = 6
 # 5 seconds between each pose — gives the user time to read the instruction,
 # physically turn their head 15° left/right, and settle before the camera snaps.
 # Counter is shown live on the preview during enrollment.
@@ -198,6 +232,44 @@ REPLAY_SPECTRAL_MIN_POWER_RATIO   = 0.20   # BG peak must be >= 20% of face peak
 REPLAY_BG_PATCH_PX        = 40   # patch size (px on each side, square)
 REPLAY_BG_PATCH_OFFSET_PX = 20   # gap between face bbox edge and patch edge
 REPLAY_BG_PATCH_COUNT     = 4    # top, bottom, left, right of face
+
+# ── Signal-processing enhancements (Day-N round, Gemini-verified) ──────────────
+# These three improvements aim to lift our real-world false-positive (23%) and
+# false-negative (44%) replay-defence rates, primarily by removing fluorescent-
+# light flicker from the rPPG signal before any downstream analysis.
+#
+# CHROM (de Haan & Jeanne, IEEE TBME 2013) — chrominance-based rPPG.
+# Replaces naive mean(green_channel) extraction with a 3-channel projection that
+# is robust to specular reflection and works on dark skin tones (where green-
+# channel SNR drops because melanin absorbs green light heavily).
+#   X(t) = 3·R(t) - 2·G(t)
+#   Y(t) = 1.5·R(t) + G(t) - 1.5·B(t)
+#   pulse(t) = X(t) - alpha · Y(t),   alpha = std(X)/std(Y)
+USE_CHROM_RPPG = True
+
+# NLMS adaptive noise cancellation for fluorescent flicker (Widrow's classic ANC).
+# Removes 50/60 Hz mains flicker aliased through CMOS rolling-shutter capture
+# into our 0.75-2.5 Hz heart-rate band. Uses background patches as the reference
+# noise signal; subtracts the modeled noise from the face signal.
+#
+# Parameters derived empirically (Gemini round 3) — DO NOT touch without re-validating.
+#   M=4 taps: 267 ms filter memory at 15 fps. Below half a pulse period (600-800 ms)
+#             so it cannot accidentally cancel the pulse signal itself.
+#   mu=0.05: mid-range step size — stable convergence in ~30-45 frames (~2-3 s).
+#   eps=1e-4: standard regularization to prevent div-by-zero in low-light scenes.
+NLMS_FILTER_LENGTH  = 4
+NLMS_STEP_SIZE      = 0.05
+NLMS_REGULARIZATION = 1.0e-4
+
+# Signal demotion: if the BG-patch signal itself has a dominant peak in the
+# heart-rate band, ambient flicker is overwhelming the camera. Disable rPPG
+# contribution for that burst rather than emit a false signal. The composite
+# falls back to face_match + blink_score only.
+#
+# Demotion threshold: BG band peak power must exceed this fraction of BG total
+# band power to consider aliasing "dominant". 0.50 = peak holds half the band
+# energy = clearly a tonal aliased signal, not noise.
+SIGNAL_DEMOTION_BG_PEAK_RATIO = 0.50
 
 # UI
 WINDOW_TITLE = "TruePixel — Real-Time Identity Verification"

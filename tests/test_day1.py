@@ -90,7 +90,14 @@ def test_enrolled_dir():
 def test_config():
     import config
     assert config.FRAME_WIDTH == 640
-    assert config.FACE_MATCH_THRESHOLD == 0.60
+    # Threshold semantics changed in May 2026: from broken (sim+1)/2 confidence
+    # to raw cosine similarity with MEAN aggregation across enrolled poses.
+    # 0.55 is the recalibrated starting point for Facenet512 + MEAN; expect
+    # this to be tuned with dev_feedback data over time.
+    assert 0.50 <= config.FACE_MATCH_THRESHOLD <= 0.80, (
+        f"FACE_MATCH_THRESHOLD={config.FACE_MATCH_THRESHOLD} out of expected "
+        f"range [0.50, 0.80] for raw cosine similarity with Facenet512."
+    )
     assert config.COMPOSITE_ALERT_THRESHOLD == 0.70
     assert len(config.LEFT_EYE_INDICES) == 6
     assert len(config.FOREHEAD_LANDMARKS) > 0
@@ -281,35 +288,29 @@ def test_rppg_synthetic_sine_detects_bpm():
     target_hz  = 1.2   # 72 BPM
     sine_wave  = 128.0 + 5.0 * np.sin(2 * np.pi * target_hz * t)
 
-    # Inject directly into buffer bypassing _extract_green_mean
+    # Inject sine directly into the (post-POS) 1-D buffer and run the FFT
+    # path manually. We don't go through process() because that requires
+    # real frames; injecting at the FFT-input stage isolates the FFT logic.
     for val in sine_wave:
         det._green_buffer.append(float(val))
 
-    # Now call process with a dummy frame and None landmarks
-    # Buffer is already full so landmarks are only needed for extraction
-    # We bypass extraction by calling _run_fft logic path directly
-    # Simplest approach: call process with None frame but patch extraction
-    import unittest.mock as mock
-    with mock.patch.object(det, '_extract_green_mean', return_value=None):
-        # Buffer is pre-filled — trigger FFT by appending one more sample
-        # and running through the FFT path manually
-        raw = np.array(det._green_buffer, dtype=np.float64)
-        raw = raw - np.mean(raw)
-        from scipy import signal as sp
-        b, a = sp.butter(3,
-                         [config.RPPG_LOW_FREQ, config.RPPG_HIGH_FREQ],
-                         btype='bandpass',
-                         fs=config.RPPG_SAMPLE_RATE)
-        filtered = sp.filtfilt(b, a, raw)
-        n = len(filtered)
-        fft_vals = np.abs(np.fft.rfft(filtered))
-        freqs    = np.fft.rfftfreq(n, d=1.0 / config.RPPG_SAMPLE_RATE)
-        mask     = (freqs >= config.RPPG_LOW_FREQ) & (freqs <= config.RPPG_HIGH_FREQ)
-        pb_power = fft_vals[mask]
-        pb_freqs = freqs[mask]
-        peak_freq  = pb_freqs[np.argmax(pb_power)]
-        heart_rate = peak_freq * 60.0
-        quality    = float(np.max(pb_power) / (np.sum(fft_vals) + 1e-10))
+    raw = np.array(det._green_buffer, dtype=np.float64)
+    raw = raw - np.mean(raw)
+    from scipy import signal as sp
+    b, a = sp.butter(3,
+                     [config.RPPG_LOW_FREQ, config.RPPG_HIGH_FREQ],
+                     btype='bandpass',
+                     fs=config.RPPG_SAMPLE_RATE)
+    filtered = sp.filtfilt(b, a, raw)
+    n = len(filtered)
+    fft_vals = np.abs(np.fft.rfft(filtered))
+    freqs    = np.fft.rfftfreq(n, d=1.0 / config.RPPG_SAMPLE_RATE)
+    mask     = (freqs >= config.RPPG_LOW_FREQ) & (freqs <= config.RPPG_HIGH_FREQ)
+    pb_power = fft_vals[mask]
+    pb_freqs = freqs[mask]
+    peak_freq  = pb_freqs[np.argmax(pb_power)]
+    heart_rate = peak_freq * 60.0
+    quality    = float(np.max(pb_power) / (np.sum(fft_vals) + 1e-10))
 
     assert abs(heart_rate - 72.0) < 15.0, \
         f"Expected ~72 BPM from 1.2 Hz sine, got {heart_rate:.1f}. " \
@@ -388,9 +389,9 @@ def test_rppg_prefers_forehead_when_both_signals_strong():
     )
 
 
-def test_rppg_extract_cheek_green_mean_handles_missing_landmarks():
+def test_rppg_extract_cheek_rgb_handles_missing_landmarks():
     """
-    _extract_cheek_green_mean must return None (not crash) when the cheek
+    _extract_rgb_means_cheek must return None (not crash) when the cheek
     landmark indices fall outside the landmark list.
     """
     from core.rppg_detector import RPPGDetector
@@ -398,8 +399,342 @@ def test_rppg_extract_cheek_green_mean_handles_missing_landmarks():
     # 5-element landmark list — both cheek indices (50, 280) are out of range
     fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
     fake_landmarks = [(10, 10)] * 5
-    result = det._extract_cheek_green_mean(fake_frame, fake_landmarks)
+    result = det._extract_rgb_means_cheek(fake_frame, fake_landmarks)
     assert result is None
+
+
+def test_pos_signal_detects_pulse_in_synthetic_rgb():
+    """
+    POS projection on synthetic RGB where ONLY green channel carries a 1.2 Hz
+    pulse (R, B constant) must produce a 1-D signal whose FFT peak is at
+    ~72 BPM. Validates the projection math end-to-end.
+    """
+    from core.rppg_detector import RPPGDetector
+    import config
+
+    det = RPPGDetector()
+    n   = det._buffer_size
+    t   = np.linspace(0, config.RPPG_BUFFER_SECONDS, n)
+
+    # Skin-tone-like baseline + green pulse at 1.2 Hz = 72 BPM
+    r_const = 180.0
+    b_const = 130.0
+    g_pulse = 150.0 + 3.0 * np.sin(2 * np.pi * 1.2 * t)
+
+    for i in range(n):
+        det._rgb_buffer_forehead.append((r_const, float(g_pulse[i]), b_const))
+
+    pos_sig = det._compute_pos_signal(det._rgb_buffer_forehead)
+    assert pos_sig.shape == (n,), f"POS signal wrong shape: {pos_sig.shape}"
+
+    # FFT the POS signal and confirm the peak is near 1.2 Hz
+    fft_vals = np.abs(np.fft.rfft(pos_sig - pos_sig.mean()))
+    freqs    = np.fft.rfftfreq(n, d=1.0 / config.RPPG_SAMPLE_RATE)
+    band     = (freqs >= config.RPPG_LOW_FREQ) & (freqs <= config.RPPG_HIGH_FREQ)
+    peak_hz  = freqs[band][np.argmax(fft_vals[band])]
+    bpm      = peak_hz * 60.0
+    assert abs(bpm - 72.0) < 15.0, (
+        f"POS-projected signal should peak at ~72 BPM for 1.2 Hz green pulse. "
+        f"Got {bpm:.1f}."
+    )
+
+
+def test_pos_signal_suppresses_common_mode_illumination():
+    """
+    POS's key advantage: a synthetic illumination change that hits R, G, B
+    equally should be SUPPRESSED in the POS-projected signal. Compares the
+    std of a green-only-mean approach (vulnerable) vs POS (robust) on the
+    same illumination flicker.
+    """
+    from core.rppg_detector import RPPGDetector
+    import config
+
+    det = RPPGDetector()
+    n   = det._buffer_size
+    t   = np.linspace(0, config.RPPG_BUFFER_SECONDS, n)
+
+    # Pure illumination flicker — same modulation hits R, G, B equally.
+    # In real video this would be overhead light flicker or auto-exposure.
+    illum = 5.0 * np.sin(2 * np.pi * 0.5 * t)  # 0.5 Hz, outside heart band
+
+    rgb = []
+    for i in range(n):
+        r = 180.0 + illum[i]
+        g = 150.0 + illum[i]
+        b = 130.0 + illum[i]
+        rgb.append((r, g, b))
+    for sample in rgb:
+        det._rgb_buffer_forehead.append(sample)
+
+    pos_sig = det._compute_pos_signal(det._rgb_buffer_forehead)
+    green   = np.array([s[1] for s in rgb])
+    green   = green - green.mean()
+
+    # POS should be much flatter than the raw green channel under pure
+    # common-mode illumination noise. 5x smaller std is a comfortable bar
+    # for synthetic perfect-common-mode data.
+    assert np.std(pos_sig) < np.std(green) / 5.0, (
+        f"POS should suppress common-mode illumination. "
+        f"green_std={np.std(green):.4f}, pos_std={np.std(pos_sig):.4f}"
+    )
+
+
+def test_pos_signal_short_buffer_returns_zeros():
+    """Edge case: too few samples → POS returns zeros (no FFT peak)."""
+    from core.rppg_detector import RPPGDetector
+    det = RPPGDetector()
+    det._rgb_buffer_forehead.append((150.0, 150.0, 150.0))
+    det._rgb_buffer_forehead.append((151.0, 151.0, 151.0))
+    pos_sig = det._compute_pos_signal(det._rgb_buffer_forehead)
+    assert np.allclose(pos_sig, 0.0), "Short buffer should produce zero-signal"
+
+
+def test_no_face_short_failure_reason_takes_priority():
+    """
+    When face_present=False, short_failure_reason must say 'No face detected'
+    REGARDLESS of any other failing signals (replay flag, low confidence,
+    weak liveness etc.). NO_FACE is the top-priority diagnostic.
+    """
+    from core.verification_scheduler import CheckResult, SessionPhase
+    r = CheckResult(
+        check_number             = 7,
+        timestamp                = 0.0,
+        phase                    = SessionPhase.STEADY_STATE,
+        face_confidence          = 0.74,   # would normally pass identity gate
+        blink_rate               = 0.0,
+        signal_quality           = 0.0,
+        heart_rate               = 0.0,
+        composite_score          = 0.0,
+        passed                   = False,
+        frames_captured          = 120,
+        face_present             = False,
+        face_present_ratio       = 0.05,
+        texture_screen_suspected = True,   # would normally win the priority list
+        lbp_variance             = 3.2,
+    )
+    reason = r.short_failure_reason()
+    assert "No face detected" in reason, (
+        f"NO_FACE must take priority over replay flag in failure reason. "
+        f"Got: {reason!r}"
+    )
+    assert "5%" in reason, (
+        f"Failure reason should embed face_present_ratio. Got: {reason!r}"
+    )
+
+
+def test_face_present_now_returns_true_when_landmarks_present():
+    """
+    _face_present_now must return True as soon as ONE sampled frame has a
+    face. We mock the camera + face_mesh so the test is webcam-free.
+    """
+    from core.verification_scheduler import VerificationScheduler
+    import unittest.mock as mock
+
+    fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    fake_landmarks = [(320, 240)] * 478
+
+    camera    = mock.Mock(); camera.get_frame.return_value = fake_frame
+    face_mesh = mock.Mock(); face_mesh.process.return_value = (fake_landmarks, fake_frame)
+
+    sched = VerificationScheduler(
+        camera         = camera,
+        face_mesh      = face_mesh,
+        blink_detector = mock.Mock(),
+        rppg_detector  = mock.Mock(),
+        face_matcher   = mock.Mock(),
+    )
+    assert sched._face_present_now(num_samples=3, inter_sample_delay_s=0.01) is True
+
+
+def test_face_present_now_returns_false_when_no_landmarks():
+    """All sampled frames have no face → returns False. Camera-free."""
+    from core.verification_scheduler import VerificationScheduler
+    import unittest.mock as mock
+
+    fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    camera    = mock.Mock(); camera.get_frame.return_value = fake_frame
+    # face_mesh.process always returns (None, frame) — no landmarks
+    face_mesh = mock.Mock(); face_mesh.process.return_value = (None, fake_frame)
+
+    sched = VerificationScheduler(
+        camera         = camera,
+        face_mesh      = face_mesh,
+        blink_detector = mock.Mock(),
+        rppg_detector  = mock.Mock(),
+        face_matcher   = mock.Mock(),
+    )
+    assert sched._face_present_now(num_samples=3, inter_sample_delay_s=0.01) is False
+
+
+def test_face_matcher_uses_raw_cosine_not_inflated():
+    """
+    Regression test for the (sim+1)/2 inflation bug. An ORTHOGONAL live
+    embedding (cosine = 0, i.e. completely unrelated face) must score 0.0,
+    not 0.5 like the old broken formula would have given.
+    """
+    from core.face_matcher import FaceMatcher
+    import unittest.mock as mock
+    import config
+
+    with mock.patch.object(FaceMatcher, '_preload_model'), \
+         mock.patch.object(FaceMatcher, '_load_enrolled'):
+        matcher = FaceMatcher()
+
+    matcher._deepface = mock.Mock()
+    D = config.FACE_EMBEDDING_DIM
+
+    # Enrolled embedding points along axis 0; live embedding orthogonal to it.
+    enrolled = np.zeros((1, D)); enrolled[0, 0] = 1.0
+    live     = np.zeros(D);      live[1]       = 1.0
+    matcher._enrolled = {"alice": enrolled}
+    matcher._deepface.represent.return_value = [{"embedding": live.tolist()}]
+
+    result = matcher.match(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result["confidence"] == 0.0, (
+        f"Orthogonal embedding (cos=0) must score 0.0 (raw cosine). "
+        f"Got {result['confidence']} — the (sim+1)/2 bug may have come back."
+    )
+    assert result["matched"] is False
+    assert result["name"] == "Unknown"
+
+
+def test_face_matcher_top_k_aggregation_rejects_one_pose_lookalike():
+    """
+    Stranger looks identical to ONE enrolled pose (cos=1.0) but orthogonal
+    to the other two (cos=0.0). With 3 enrolled poses, TOP-K mean uses
+    K = ceil(3/2) = 2 → score = (1.0 + 0.0) / 2 = 0.5, sitting BELOW the
+    0.55 match threshold → correctly rejected.
+
+    Old MAX aggregation would have scored 1.0 → false positive.
+    Previous all-poses MEAN scored 0.333 (also rejected, but it drove down
+    genuine-user scores too aggressively — see test_face_matcher_accepts_genuine_user).
+    """
+    from core.face_matcher import FaceMatcher
+    import unittest.mock as mock
+    import config
+
+    with mock.patch.object(FaceMatcher, '_preload_model'), \
+         mock.patch.object(FaceMatcher, '_load_enrolled'):
+        matcher = FaceMatcher()
+
+    matcher._deepface = mock.Mock()
+    D = config.FACE_EMBEDDING_DIM
+
+    # Build 3 enrolled poses + a "live" embedding that's close to pose-0
+    # only. We construct embeddings with known cosines by mixing unit vectors.
+    def unit(idx):
+        v = np.zeros(D); v[idx] = 1.0; return v
+
+    pose_a = unit(0)
+    pose_b = unit(1)
+    pose_c = unit(2)
+    enrolled = np.stack([pose_a, pose_b, pose_c])
+
+    # Live embedding lies along axis 0 → cosines are exactly (1, 0, 0)
+    # against the three poses. TOP-2 mean = 0.5 — just below 0.55, rejected.
+    live = pose_a.copy()
+
+    matcher._enrolled = {"alice": enrolled}
+    matcher._deepface.represent.return_value = [{"embedding": live.tolist()}]
+
+    result = matcher.match(np.zeros((100, 100, 3), dtype=np.uint8))
+    # TOP-2 of sorted (1.0, 0.0, 0.0) = (1.0, 0.0) → mean = 0.5
+    assert abs(result["confidence"] - 0.5) < 0.01, (
+        f"Expected TOP-K mean ~0.5, got {result['confidence']}."
+    )
+    assert result["matched"] is False, (
+        "TOP-K aggregation must still reject a one-pose-only lookalike "
+        "(score 0.5 < FACE_MATCH_THRESHOLD = 0.55)."
+    )
+
+
+def test_face_matcher_accepts_genuine_user_across_all_poses():
+    """
+    Genuine user: live embedding is similar to ALL THREE enrolled poses
+    (each cos ~0.7). MEAN = 0.7, above the 0.55 threshold → accepted.
+    """
+    from core.face_matcher import FaceMatcher
+    import unittest.mock as mock
+    import config
+
+    with mock.patch.object(FaceMatcher, '_preload_model'), \
+         mock.patch.object(FaceMatcher, '_load_enrolled'):
+        matcher = FaceMatcher()
+
+    matcher._deepface = mock.Mock()
+    D = config.FACE_EMBEDDING_DIM
+
+    # Three enrolled poses, each pointing in a similar but slightly different
+    # direction. A live embedding equal to the AVERAGE of the three has
+    # cosine ~0.7+ against each.
+    base = np.zeros(D); base[:5] = [1.0, 1.0, 1.0, 1.0, 1.0]
+    pose_a = base.copy(); pose_a[5] = 0.5
+    pose_b = base.copy(); pose_b[6] = 0.5
+    pose_c = base.copy(); pose_c[7] = 0.5
+    enrolled = np.stack([pose_a, pose_b, pose_c])
+    live     = np.mean(enrolled, axis=0)
+
+    matcher._enrolled = {"rahul": enrolled}
+    matcher._deepface.represent.return_value = [{"embedding": live.tolist()}]
+
+    result = matcher.match(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result["matched"] is True, (
+        f"Genuine user (mean cosine ~{result['confidence']}) should match. "
+        f"Threshold is {config.FACE_MATCH_THRESHOLD}."
+    )
+    assert result["name"] == "rahul"
+
+
+def test_face_matcher_rejects_dim_mismatch_silently():
+    """
+    Enrolled embeddings at the wrong dimension (e.g. 128 from old Facenet
+    when current model is Facenet512) must not match — they're stale and
+    should be ignored until re-extraction completes.
+    """
+    from core.face_matcher import FaceMatcher
+    import unittest.mock as mock
+    import config
+
+    with mock.patch.object(FaceMatcher, '_preload_model'), \
+         mock.patch.object(FaceMatcher, '_load_enrolled'):
+        matcher = FaceMatcher()
+
+    matcher._deepface = mock.Mock()
+    D = config.FACE_EMBEDDING_DIM
+
+    # Stale 128-dim enrolled embedding, fresh 512-dim live embedding.
+    stale_enrolled = np.random.RandomState(0).randn(3, 128)
+    live           = np.zeros(D); live[0] = 1.0
+    matcher._enrolled = {"alice_stale": stale_enrolled}
+    matcher._deepface.represent.return_value = [{"embedding": live.tolist()}]
+
+    result = matcher.match(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert result["matched"] is False
+    assert result["confidence"] == 0.0
+    assert result["name"] == "Unknown"
+
+
+def test_face_present_default_is_true_for_normal_check():
+    """
+    A CheckResult constructed without explicitly setting face_present must
+    default to True so existing call sites (tests, log replays) don't break.
+    """
+    from core.verification_scheduler import CheckResult, SessionPhase
+    r = CheckResult(
+        check_number    = 1,
+        timestamp       = 0.0,
+        phase           = SessionPhase.STEADY_STATE,
+        face_confidence = 0.80,
+        blink_rate      = 15.0,
+        signal_quality  = 0.20,
+        heart_rate      = 72.0,
+        composite_score = 0.75,
+        passed          = True,
+        frames_captured = 120,
+    )
+    assert r.face_present is True
+    assert r.face_present_ratio == 1.0
 
 
 def test_rppg_reset_clears_cheek_and_active_roi():
@@ -638,6 +973,130 @@ def test_is_spectral_replay_suspected_false_on_weak_face_signal():
     assert result is False, f"Expected False on flat face signal, got {result}"
 
 
+# ── Day-N: NLMS adaptive flicker cancellation + signal demotion ────────────
+
+def test_nlms_cancels_shared_noise():
+    """
+    Inject the same sinusoidal noise into both primary and reference channels.
+    After NLMS converges, the cleaned output should have much lower RMS than
+    the primary input — proving the filter is modeling and subtracting the
+    shared noise component.
+    """
+    from core.rppg_detector import NLMSFilter
+    import config
+
+    rng = np.random.default_rng(seed=7)
+    n   = 240  # 16 seconds at 15 fps — long enough for convergence
+    t   = np.linspace(0, 16, n)
+
+    noise   = np.sin(2 * np.pi * 5.0 * t) * 4.0     # 5 Hz aliased flicker
+    primary = noise + rng.normal(0, 0.5, n)         # noise + small residual
+    ref     = noise + rng.normal(0, 0.5, n)         # near-identical noise reference
+
+    flt = NLMSFilter(
+        length=config.NLMS_FILTER_LENGTH,
+        mu=config.NLMS_STEP_SIZE,
+        eps=config.NLMS_REGULARIZATION,
+    )
+    cleaned = flt.batch(primary, ref)
+
+    # Allow first ~30 frames for convergence; measure RMS on the rest.
+    rms_in  = float(np.sqrt(np.mean(primary[30:] ** 2)))
+    rms_out = float(np.sqrt(np.mean(cleaned[30:] ** 2)))
+    assert rms_out < rms_in * 0.4, (
+        f"NLMS should reduce RMS by >60% on shared noise; "
+        f"input RMS={rms_in:.3f}, output RMS={rms_out:.3f}, "
+        f"reduction={1 - rms_out/rms_in:.1%}"
+    )
+
+
+def test_nlms_passthrough_when_reference_zero():
+    """
+    When the reference signal is zero, NLMS has nothing to subtract.
+    The cleaned output should equal the primary input (within rounding).
+    """
+    from core.rppg_detector import NLMSFilter
+    import config
+
+    n       = 60
+    primary = np.linspace(-2.0, 2.0, n) + 0.1 * np.sin(np.linspace(0, 6, n))
+    ref     = np.zeros(n)
+
+    flt = NLMSFilter(
+        length=config.NLMS_FILTER_LENGTH,
+        mu=config.NLMS_STEP_SIZE,
+        eps=config.NLMS_REGULARIZATION,
+    )
+    out = flt.batch(primary, ref)
+    diff = float(np.max(np.abs(out - primary)))
+    assert diff < 1e-9, f"Expected near-zero diff vs input, got {diff}"
+
+
+def test_nlms_reset_clears_state():
+    """reset() must zero out the weight vector AND the reference history."""
+    from core.rppg_detector import NLMSFilter
+    import config
+
+    flt = NLMSFilter(
+        length=config.NLMS_FILTER_LENGTH,
+        mu=config.NLMS_STEP_SIZE,
+        eps=config.NLMS_REGULARIZATION,
+    )
+    # Run a few steps to populate internal state
+    for _ in range(20):
+        flt.step(1.0, 1.0)
+    assert np.any(flt._w != 0.0), "weights should be non-zero after updates"
+    assert np.any(flt._x != 0.0), "reference history should be populated"
+
+    flt.reset()
+    assert float(np.sum(np.abs(flt._w))) == 0.0, "weights must be zero after reset"
+    assert float(np.sum(np.abs(flt._x))) == 0.0, "reference history must be zero after reset"
+
+
+def test_ambient_aliasing_detected_on_dominant_peak():
+    """
+    If the BG reference itself carries a strong sinusoid in the heart-rate
+    band, _is_ambient_aliasing_active() must return True.
+    """
+    from core.rppg_detector import RPPGDetector
+    det = RPPGDetector()
+    n = 120
+    t = np.linspace(0, 8, n)
+    # 1.2 Hz dominant peak (72 BPM), big amplitude, tiny noise floor
+    bg = 100.0 + 8.0 * np.sin(2 * np.pi * 1.2 * t) + 0.05 * np.random.randn(n)
+    assert det._is_ambient_aliasing_active(bg) is True, (
+        "Expected aliasing detection on dominant 1.2 Hz BG sinusoid"
+    )
+
+
+def test_ambient_aliasing_not_detected_on_noise():
+    """
+    If the BG is broadband noise (no dominant peak), the demotion check
+    must return False — we don't want to disable rPPG on real backgrounds.
+    """
+    from core.rppg_detector import RPPGDetector
+    rng = np.random.default_rng(seed=11)
+    det = RPPGDetector()
+    bg  = 100.0 + rng.normal(0, 1.0, 120)
+    assert det._is_ambient_aliasing_active(bg) is False, (
+        "Expected no aliasing detection on broadband noise BG"
+    )
+
+
+def test_ambient_aliasing_flag_in_result():
+    """The result dict must include the ambient_aliasing boolean key."""
+    from core.rppg_detector import RPPGDetector
+    det = RPPGDetector()
+    # Force a synthetic result so we don't need camera data
+    result = det._result(0.0, 0.0, "Initializing")
+    assert "ambient_aliasing" in result, (
+        "Expected key 'ambient_aliasing' in rPPG result dict"
+    )
+    assert isinstance(result["ambient_aliasing"], bool), (
+        f"ambient_aliasing must be bool, got {type(result['ambient_aliasing'])}"
+    )
+
+
 def test_replay_pearson_threshold_disabled():
     """
     Path C update: legacy Pearson threshold is now 0.99 (effectively disabled).
@@ -793,8 +1252,19 @@ check("RPPGDetector FFT detects 1.2 Hz sine as ~72 BPM", test_rppg_synthetic_sin
 check("RPPGDetector reset clears all state",              test_rppg_reset_clears_buffer)
 check("rPPG fallback picks cheek when forehead is flat",   test_rppg_fallback_picks_cheek_when_forehead_is_flat)
 check("rPPG prefers forehead when both signals strong",    test_rppg_prefers_forehead_when_both_signals_strong)
-check("Cheek extraction returns None on missing landmarks", test_rppg_extract_cheek_green_mean_handles_missing_landmarks)
+check("Cheek RGB extraction returns None on missing landmarks", test_rppg_extract_cheek_rgb_handles_missing_landmarks)
 check("Reset clears cheek buffer and active_roi",          test_rppg_reset_clears_cheek_and_active_roi)
+check("POS projection detects pulse in synthetic RGB",     test_pos_signal_detects_pulse_in_synthetic_rgb)
+check("POS suppresses common-mode illumination",           test_pos_signal_suppresses_common_mode_illumination)
+check("POS returns zeros on too-short buffer",             test_pos_signal_short_buffer_returns_zeros)
+check("NO_FACE short_failure_reason takes priority",       test_no_face_short_failure_reason_takes_priority)
+check("_face_present_now returns True with landmarks",     test_face_present_now_returns_true_when_landmarks_present)
+check("_face_present_now returns False without landmarks", test_face_present_now_returns_false_when_no_landmarks)
+check("face_present defaults True for normal checks",      test_face_present_default_is_true_for_normal_check)
+check("FaceMatcher: orthogonal embedding gives 0.0 (no inflation)", test_face_matcher_uses_raw_cosine_not_inflated)
+check("FaceMatcher: TOP-K-of-poses rejects one-pose lookalike", test_face_matcher_top_k_aggregation_rejects_one_pose_lookalike)
+check("FaceMatcher: genuine user across all 3 poses passes",  test_face_matcher_accepts_genuine_user_across_all_poses)
+check("FaceMatcher: stale dim-mismatch enrolment ignored",    test_face_matcher_rejects_dim_mismatch_silently)
 check("rPPG buffer fill ratio reachable from burst config", test_rppg_buffer_fill_ratio_matches_burst)
 check("Video replay attack fails with noise floor",    test_video_replay_attack_fails)
 check("Real user office lighting passes",              test_real_user_office_lighting_passes)
@@ -812,6 +1282,12 @@ check("Spectral replay True when BG shares face peak freq",     test_is_spectral
 check("Spectral replay False when BG peak differs from face",   test_is_spectral_replay_suspected_false_when_bg_different_freq)
 check("Spectral replay False on empty BG buffers",              test_is_spectral_replay_suspected_false_on_empty_buffers)
 check("Spectral replay False on flat (no-peak) face signal",    test_is_spectral_replay_suspected_false_on_weak_face_signal)
+check("NLMS cancels shared noise from primary signal",          test_nlms_cancels_shared_noise)
+check("NLMS passes signal through when reference is zero",      test_nlms_passthrough_when_reference_zero)
+check("NLMS reset clears weights and reference history",        test_nlms_reset_clears_state)
+check("Ambient aliasing detected on flicker-dominated BG",     test_ambient_aliasing_detected_on_dominant_peak)
+check("Ambient aliasing NOT detected on noisy BG",              test_ambient_aliasing_not_detected_on_noise)
+check("ambient_aliasing flag exposed in _result dict",          test_ambient_aliasing_flag_in_result)
 
 
 # ── Multi-signal liveness (Improvement 1) ───────────────────────────────────

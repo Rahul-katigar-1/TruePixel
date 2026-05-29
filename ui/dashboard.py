@@ -10,6 +10,7 @@ from tkinter import font as tkfont
 import cv2
 from PIL import Image, ImageTk
 import threading
+from collections import deque
 import config
 from ui.components import StatusIndicator, MetricRow, LogPanel, RPPGGraphPanel, FeedbackPanel
 
@@ -35,6 +36,18 @@ class Dashboard:
         # Latest CheckResult — held so the dev feedback button can write its
         # full signal vector to CSV when the developer clicks Real/Fake.
         self._last_check_result = None
+
+        # ── Sequential labelling queue ─────────────────────────────────────
+        # If a new burst completes while the developer is still about to
+        # click Real/Fake on the previous one, we MUST NOT replace the panel
+        # contents — that's how a fake check gets accidentally labelled as
+        # real when the new image swaps in mid-click. Instead, queue the new
+        # result; it'll be presented after the current one is labelled.
+        # Capped to avoid unbounded growth if the developer steps away.
+        self._pending_label_queue: deque = deque(maxlen=20)
+        # True iff the panel currently has a check the developer hasn't
+        # responded to (Real / Fake / Ignore). Mirrors FeedbackPanel state.
+        self._panel_awaiting_label: bool = False
 
         self._build_layout()
         self.log.add_entry("TruePixel started. Initializing detectors...")
@@ -203,10 +216,13 @@ class Dashboard:
 
             # Overall status — prefer the authoritative CheckResult (set by
             # notify_check_complete) over the per-frame heuristic so that the
-            # banner says VERIFIED or names the specific failure reason.
+            # banner says VERIFIED, NO FACE, or names the specific failure.
             result = self._last_check_result
             if result is not None:
-                if result.passed:
+                if not result.face_present:
+                    # Inconclusive — user is out of frame, neither pass nor fail
+                    self.status_indicator.set_no_face()
+                elif result.passed:
                     self.status_indicator.set_verified()
                 else:
                     self.status_indicator.set_alert(result.short_failure_reason())
@@ -220,6 +236,20 @@ class Dashboard:
         def _u():
             self.status_indicator.set_alert(message)
             self.root.configure(bg="#2a0000")
+        self.root.after(0, _u)
+
+    def show_no_face(self):
+        """
+        Amber NO FACE banner. Inconclusive state — the user is out of frame,
+        verification is paused until they return. Does NOT zero out the
+        metric panels (they keep their last verified values so the operator
+        can still see the most recent identity/blink/heartbeat readings).
+        The countdown widget below the video shows time until the next check.
+        Safe to call from a background thread.
+        """
+        def _u():
+            self.status_indicator.set_no_face()
+            self.root.configure(bg=config.BG_COLOR)
         self.root.after(0, _u)
 
     def clear_alert(self):
@@ -294,19 +324,57 @@ class Dashboard:
     def notify_check_complete(self, result):
         """
         Called by main.py after a verification check finishes.
-        Stores the full CheckResult so the dev feedback button can write
-        its signal vector to CSV when the developer clicks Real/Fake,
-        and enables the buttons for this new check_number.
-        The burst frame (result.last_frame) is passed through so the
-        FeedbackPanel can show the exact image being labelled — useful
-        when transitioning between real face and replay attack mid-burst.
+
+        Sequential-labelling semantics: if the developer is still about to
+        click Real/Fake on a previous check, we DO NOT swap the panel image
+        — that's how a fake gets accidentally labelled as real when a new
+        image lands between "about to click" and "clicked". Instead we
+        queue the new result and present it after the current one is
+        responded to.
+
+        NO_FACE checks bypass the queue: there's nothing to label, so we
+        clear the panel immediately rather than wasting a queue slot.
         """
-        self._last_check_result = result
-        if self.feedback_panel is not None:
-            # Use Tk's after() so this is safe to call from any thread.
-            self.root.after(0, lambda: self.feedback_panel.set_pending_check(
-                result.check_number, result.last_frame, result.passed
+        if self.feedback_panel is None:
+            return  # feedback panel disabled (DEV_FEEDBACK_BUTTON=False)
+
+        # NO_FACE always clears the panel — no labelling needed, and the
+        # panel must visibly reflect "no face" so the dev doesn't try to
+        # label whatever was there before.
+        if not getattr(result, "face_present", True):
+            self._last_check_result = result
+            self._panel_awaiting_label = False
+            self.root.after(0, lambda r=result: self.feedback_panel.set_pending_check(
+                r.check_number, None, None
             ))
+            return
+
+        # If the panel is busy waiting for a click, queue the new result.
+        if self._panel_awaiting_label:
+            self._pending_label_queue.append(result)
+            queue_depth = len(self._pending_label_queue)
+            self.root.after(0, lambda d=queue_depth:
+                self.feedback_panel.set_queue_depth(d))
+            return
+
+        # Panel is free — present this check immediately.
+        self._present_for_labelling(result)
+
+    def _present_for_labelling(self, result):
+        """
+        Internal: show a CheckResult in the feedback panel and mark the
+        panel as awaiting a click. Called both by notify_check_complete
+        (when panel is free) and by _dev_on_label (when popping queue).
+        """
+        self._last_check_result    = result
+        self._panel_awaiting_label = True
+        self.root.after(0, lambda r=result: self.feedback_panel.set_pending_check(
+            r.check_number, r.last_frame, r.passed
+        ))
+        # Update queue badge so the dev sees the backlog count.
+        queue_depth = len(self._pending_label_queue)
+        self.root.after(0, lambda d=queue_depth:
+            self.feedback_panel.set_queue_depth(d))
 
     def _dev_on_label(self, label, check_number):
         """
@@ -334,12 +402,16 @@ class Dashboard:
             self.log.add_entry(
                 f"DEV: label '{label}' ignored — no matching check #{check_number}."
             )
+            self._panel_awaiting_label = False
+            self._advance_label_queue()
             return
 
         if label == "ignore":
             self.log.add_entry(
                 f"DEV: check #{check_number} ignored (not added to dataset)."
             )
+            self._panel_awaiting_label = False
+            self._advance_label_queue()
             return
 
         # Save the burst frame alongside the labelled row so the dataset
@@ -423,6 +495,24 @@ class Dashboard:
             )
         except Exception as e:
             self.log.add_entry(f"DEV: failed to write feedback CSV: {e}")
+
+        # Label written — release the panel and present the next queued check
+        # (if any) so the dev can keep flowing through the backlog.
+        self._panel_awaiting_label = False
+        self._advance_label_queue()
+
+    def _advance_label_queue(self):
+        """
+        Pop the next queued CheckResult (if any) and present it for labelling.
+        Called after every Real/Fake/Ignore click so the dev can flow through
+        a backlog without missing any check.
+        """
+        if not self._pending_label_queue:
+            # Nothing queued — update the badge so the panel shows "idle".
+            self.root.after(0, lambda: self.feedback_panel.set_queue_depth(0))
+            return
+        next_result = self._pending_label_queue.popleft()
+        self._present_for_labelling(next_result)
 
     def on_close(self, callback):
         """Register a callback for when the window is closed."""

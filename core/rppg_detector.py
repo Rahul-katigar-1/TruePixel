@@ -61,6 +61,71 @@ logger = logging.getLogger(__name__)
 MIN_BUFFER_FILL_RATIO = 0.75
 
 
+class NLMSFilter:
+    """
+    Normalized Least-Mean-Squares adaptive filter for ambient-flicker cancellation.
+
+    Subtracts the modeled noise component of a primary signal (the face POS
+    signal) using a reference noise signal (the background-patch average) as
+    the regressor. Mathematically:
+
+        x(n)  = [ref(n), ref(n-1), ..., ref(n-M+1)]   # M-tap history
+        y(n)  = w(n) · x(n)                            # estimated noise in face
+        e(n)  = primary(n) - y(n)                      # cleaned face sample
+        w(n+1) = w(n) + (mu / (||x(n)||² + eps)) · e(n) · x(n)
+
+    The "Normalized" variant divides the step by reference signal energy so
+    the filter stays stable regardless of overall brightness (e.g. dim home
+    office vs bright meeting room).
+
+    Parameters are exposed via config.NLMS_FILTER_LENGTH / NLMS_STEP_SIZE /
+    NLMS_REGULARIZATION and documented there. See:
+      Widrow & Stearns, "Adaptive Signal Processing" (1985)
+      For rPPG application: IEEE TBME 2021 (motion artifact removal in rPPG)
+    """
+
+    def __init__(self, length: int, mu: float, eps: float):
+        self.length = int(length)
+        self.mu     = float(mu)
+        self.eps    = float(eps)
+        self._w     = np.zeros(self.length, dtype=np.float64)
+        self._x     = np.zeros(self.length, dtype=np.float64)
+
+    def step(self, primary: float, reference: float) -> float:
+        """Single-sample NLMS update. Returns the cleaned sample e(n)."""
+        # Shift the reference history by one sample
+        self._x[1:] = self._x[:-1]
+        self._x[0]  = reference
+        # Predict the noise component in the primary signal
+        y = float(np.dot(self._w, self._x))
+        # Error = primary - predicted noise = cleaned signal
+        e = primary - y
+        # Normalized weight update (NLMS)
+        norm = float(np.dot(self._x, self._x)) + self.eps
+        self._w += (self.mu / norm) * e * self._x
+        return e
+
+    def batch(self, primary_arr, reference_arr):
+        """
+        Apply the filter to two equal-length 1-D arrays in sequence.
+        Resets internal state at the start (so each burst is independent).
+        Returns the cleaned 1-D numpy array.
+        """
+        primary_arr   = np.asarray(primary_arr,   dtype=np.float64)
+        reference_arr = np.asarray(reference_arr, dtype=np.float64)
+        n_out = min(len(primary_arr), len(reference_arr))
+        self.reset()
+        out = np.empty(n_out, dtype=np.float64)
+        for i in range(n_out):
+            out[i] = self.step(primary_arr[i], reference_arr[i])
+        return out
+
+    def reset(self):
+        """Clear weights and reference history. Called at every burst start."""
+        self._w.fill(0.0)
+        self._x.fill(0.0)
+
+
 class RPPGDetector:
     """
     Detects heartbeat signal from the forehead region of a webcam frame.
@@ -73,12 +138,22 @@ class RPPGDetector:
 
     def __init__(self):
         self._buffer_size = config.RPPG_BUFFER_SECONDS * config.RPPG_SAMPLE_RATE
-        # Primary forehead ROI — best skin area when exposed
+        # ── RGB ROI buffers — Plane-Orthogonal-to-Skin (POS) algorithm ─────
+        # Each buffer holds (R, G, B) tuples per frame so the POS projection
+        # (Wang et al. 2017) can cancel illumination drift that the previous
+        # green-only mean was vulnerable to. Reference benchmark: POS gives
+        # ~1 BPM MAE on UBFC-rPPG vs ~7 BPM for green-only mean.
+        # _green_buffer / _cheek_buffer are KEPT as aliases for the projected
+        # POS signal so the live graph and existing diagnostic methods can
+        # consume a 1-D signal without each having to recompute POS.
+        self._rgb_buffer_forehead: deque = deque(maxlen=self._buffer_size)
+        self._rgb_buffer_cheek:    deque = deque(maxlen=self._buffer_size)
+
+        # POS-projected 1-D signals — refreshed every frame past the fill
+        # threshold. These are what the FFT, graph, and replay diagnostics
+        # actually consume. Holding them in deques keeps the same interface
+        # as before so downstream callers don't need to know about POS.
         self._green_buffer: deque = deque(maxlen=self._buffer_size)
-        # Fallback cheek ROI — used when forehead is occluded by cap/hair/hand.
-        # We always sample both in parallel and pick the buffer with higher
-        # std-dev once both are filled (real pulse → high std; occluded ROI
-        # over a solid hat or hair gives near-flat output → low std).
         self._cheek_buffer: deque = deque(maxlen=self._buffer_size)
         self._active_roi: str = "forehead"
 
@@ -87,12 +162,29 @@ class RPPGDetector:
         # ROIs by sampling adjacent to the face — see config.py rationale).
         # Keys: "top", "bottom", "left", "right" (filled lazily by process()).
         self._bg_patch_buffers: dict[str, deque] = {}
+
+        # NLMS adaptive flicker cancellation. The POS signal is fed through
+        # this filter using the BG-patch average as a noise reference, before
+        # being passed to the FFT. Parameters fixed in config — do not tune
+        # at runtime without re-validating.
+        self._nlms_filter = NLMSFilter(
+            length=config.NLMS_FILTER_LENGTH,
+            mu=config.NLMS_STEP_SIZE,
+            eps=config.NLMS_REGULARIZATION,
+        )
+
+        # Ambient-aliasing demotion flag. Set True when the BG signal itself
+        # carries a dominant peak in the heart-rate band — meaning fluorescent
+        # flicker is overwhelming the camera and rPPG cannot be trusted for
+        # this burst. The scheduler reads this and zeroes HEARTBEAT_WEIGHT.
+        self._last_ambient_aliasing: bool = False
+
         self._last_heart_rate: float = 0.0
         self._last_quality: float = 0.0
         self._last_status: str = "Initializing"
         self._last_filtered: list = []
         logger.info(
-            f"RPPGDetector initialized. "
+            f"RPPGDetector initialized (POS + NLMS flicker cancellation). "
             f"Buffer: {self._buffer_size} samples "
             f"({config.RPPG_BUFFER_SECONDS}s at {config.RPPG_SAMPLE_RATE}fps)"
         )
@@ -118,19 +210,20 @@ class RPPGDetector:
             self._last_status = "No signal"
             return self._result(0.0, 0.0, "No signal")
 
-        # ── Step 1: Extract green mean from BOTH ROIs (forehead + cheek) ──
-        # Sample both every frame; ROI selection happens later once buffers fill.
-        forehead_mean = self._extract_green_mean(frame, landmarks)
-        cheek_mean    = self._extract_cheek_green_mean(frame, landmarks)
+        # ── Step 1: Extract (R, G, B) means from BOTH ROIs ─────────────────
+        # POS needs all three channels per frame. Sample forehead AND cheek
+        # in parallel; per-burst ROI selection happens later via POS-signal std.
+        forehead_rgb = self._extract_rgb_means_forehead(frame, landmarks)
+        cheek_rgb    = self._extract_rgb_means_cheek(frame, landmarks)
 
-        if forehead_mean is None and cheek_mean is None:
+        if forehead_rgb is None and cheek_rgb is None:
             self._last_status = "No signal"
             return self._result(0.0, 0.0, "No signal")
 
-        if forehead_mean is not None:
-            self._green_buffer.append(forehead_mean)
-        if cheek_mean is not None:
-            self._cheek_buffer.append(cheek_mean)
+        if forehead_rgb is not None:
+            self._rgb_buffer_forehead.append(forehead_rgb)
+        if cheek_rgb is not None:
+            self._rgb_buffer_cheek.append(cheek_rgb)
 
         # Sample 4 face-adjacent background patches in parallel — replay defence
         # (PPGSecure Fix A). Each patch gets its own rolling buffer. We compare
@@ -142,27 +235,57 @@ class RPPGDetector:
             self._bg_patch_buffers[label].append(value)
 
         # ── Step 2: Check if at least one ROI buffer has enough data ─────
-        fill_ratio_forehead = len(self._green_buffer) / self._buffer_size
-        fill_ratio_cheek    = len(self._cheek_buffer) / self._buffer_size
+        fill_ratio_forehead = len(self._rgb_buffer_forehead) / self._buffer_size
+        fill_ratio_cheek    = len(self._rgb_buffer_cheek)    / self._buffer_size
         if max(fill_ratio_forehead, fill_ratio_cheek) < MIN_BUFFER_FILL_RATIO:
             self._last_status = "Initializing"
             return self._result(0.0, 0.0, "Initializing")
 
-        # ── Step 2b: Pick the ROI with the stronger signal ────────────────
+        # ── Step 2b: Compute POS-projected signal for each filled ROI ─────
+        # POS (Wang et al. 2017) projects the 3-channel time series onto a
+        # 2-D subspace orthogonal to skin-tone direction, cancelling shared
+        # illumination noise while preserving the pulse. The output is a 1-D
+        # signal we then bandpass + FFT exactly like the old green-mean.
+        forehead_pos = (self._compute_pos_signal(self._rgb_buffer_forehead)
+                        if fill_ratio_forehead >= MIN_BUFFER_FILL_RATIO else None)
+        cheek_pos    = (self._compute_pos_signal(self._rgb_buffer_cheek)
+                        if fill_ratio_cheek    >= MIN_BUFFER_FILL_RATIO else None)
+
+        # Refresh the 1-D POS buffers so the graph and the diagnostic methods
+        # (Pearson / spectral) can consume them via the existing interface.
+        if forehead_pos is not None:
+            self._green_buffer.clear()
+            self._green_buffer.extend(forehead_pos.tolist())
+        if cheek_pos is not None:
+            self._cheek_buffer.clear()
+            self._cheek_buffer.extend(cheek_pos.tolist())
+
+        # ── Step 2c: Pick the ROI with the stronger POS signal ───────────
         # Higher std-dev = more dynamic range = more likely to contain a real
-        # pulse (a flat ROI over fabric/hair/skin-tone-of-hand has near-zero
-        # std after detrend). Forehead usually wins when exposed; cheek wins
-        # when the forehead is occluded by a cap or hair.
+        # pulse. Forehead usually wins when exposed; cheek wins when the
+        # forehead is occluded by a cap or hair. We compare std of the POS
+        # signal (not the raw RGB), because POS is what the FFT consumes.
         chosen_buffer, chosen_roi = self._pick_active_roi(
             fill_ratio_forehead, fill_ratio_cheek
         )
         self._active_roi = chosen_roi
 
-        # ── Step 3: Bandpass filter on the chosen buffer ──────────────────
-        raw = np.array(chosen_buffer, dtype=np.float64)
+        # ── Step 3a: NLMS adaptive flicker cancellation ─────────────────
+        # Subtract fluorescent-light flicker (50/60 Hz aliased into the heart-
+        # rate band by CMOS rolling shutter) from the POS signal using the
+        # BG-patch average as a noise reference. If the BG patches are sharing
+        # the same flicker as the face, NLMS will model and cancel it; if not,
+        # the filter converges toward w=0 and the output equals the input.
+        bg_reference = self._compute_bg_reference_signal(len(chosen_buffer))
+        chosen_arr   = np.asarray(chosen_buffer, dtype=np.float64)
 
-        # Detrend removes slow drift (e.g. lighting changes, head movement)
-        raw = raw - np.mean(raw)
+        if bg_reference is not None and len(bg_reference) == len(chosen_arr):
+            cleaned = self._nlms_filter.batch(chosen_arr, bg_reference)
+        else:
+            cleaned = chosen_arr  # no reference available, pass through
+
+        # ── Step 3b: Bandpass filter on the cleaned POS signal ──────────
+        raw = cleaned - np.mean(cleaned)
 
         try:
             b, a = scipy_signal.butter(
@@ -175,6 +298,15 @@ class RPPGDetector:
         except Exception as e:
             logger.warning(f"Bandpass filter failed: {e}")
             return self._result(0.0, 0.0, "Measuring")
+
+        # ── Step 3c: Ambient-aliasing demotion check ────────────────────
+        # If the BG-patch average itself carries a dominant peak inside the
+        # heart-rate band, fluorescent flicker is overwhelming the camera.
+        # rPPG cannot be trusted for this burst; flag and let the scheduler
+        # zero out the rPPG composite weight rather than emit a false signal.
+        self._last_ambient_aliasing = self._is_ambient_aliasing_active(
+            bg_reference
+        )
 
         # ── Step 4: FFT ───────────────────────────────────────────────────
         n = len(filtered)
@@ -225,16 +357,70 @@ class RPPGDetector:
         Clear buffer and state. Call before each burst capture.
         Matches BlinkDetector.reset() pattern for consistency.
         """
+        self._rgb_buffer_forehead.clear()
+        self._rgb_buffer_cheek.clear()
         self._green_buffer.clear()
         self._cheek_buffer.clear()
         for buf in self._bg_patch_buffers.values():
             buf.clear()
+        self._nlms_filter.reset()
+        self._last_ambient_aliasing = False
         self._last_heart_rate  = 0.0
         self._last_quality     = 0.0
         self._last_status      = "Initializing"
         self._last_filtered    = []
         self._active_roi       = "forehead"
         logger.debug("RPPGDetector reset.")
+
+    def _compute_pos_signal(self, rgb_buffer) -> np.ndarray:
+        """
+        Plane-Orthogonal-to-Skin (POS) projection.
+        Wang et al., "Algorithmic Principles of Remote PPG", IEEE TBME 2017.
+
+        Takes a buffer of (R, G, B) tuples and returns a 1-D signal whose
+        FFT peak corresponds to the heart rate, with illumination noise
+        substantially cancelled. The math:
+
+            1. Normalise each channel by its mean:  Cn(t) = C(t) / mean(C)
+            2. Project onto two orthogonal axes:
+                 S1 = Gn - Bn
+                 S2 = -2 * Rn + Gn + Bn
+            3. Combine using alpha = std(S1) / std(S2):
+                 h  = S1 + alpha * S2
+
+        The trick: S1 and S2 are *orthogonal* to the skin-tone direction
+        in RGB space, so any change that affects all three channels equally
+        (overhead light flicker, monitor brightness, camera auto-exposure)
+        cancels out. The pulse, which affects channels unequally because
+        blood absorbs green more than red/blue, survives the projection.
+
+        We use the simple batch form here (one alpha per burst). The
+        overlap-add windowed form from the paper buys ~0.3 BPM more
+        accuracy and isn't worth the complexity for an 8-second window.
+        """
+        if len(rgb_buffer) < 16:
+            # Too few samples to estimate std reliably — return zeros so
+            # downstream FFT picks up no peak and signal quality stays low.
+            return np.zeros(max(len(rgb_buffer), 1), dtype=np.float64)
+
+        rgb = np.asarray(rgb_buffer, dtype=np.float64)   # shape (N, 3)
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+
+        # Per-channel normalisation by mean. Adding epsilon avoids divide-by-zero
+        # when an ROI is completely black (e.g. camera lens-cap on briefly).
+        r_n = r / (np.mean(r) + 1e-10) - 1.0
+        g_n = g / (np.mean(g) + 1e-10) - 1.0
+        b_n = b / (np.mean(b) + 1e-10) - 1.0
+
+        # Two projections orthogonal to skin-tone direction
+        s1 = g_n - b_n
+        s2 = -2.0 * r_n + g_n + b_n
+
+        std1 = float(np.std(s1))
+        std2 = float(np.std(s2))
+        alpha = std1 / (std2 + 1e-10)
+
+        return s1 + alpha * s2
 
     def _pick_active_roi(self, fill_forehead: float, fill_cheek: float):
         """
@@ -266,6 +452,71 @@ class RPPGDetector:
         if cheek_std > forehead_std * 1.10:   # cheek must be ≥10% stronger
             return self._cheek_buffer, "cheek"
         return self._green_buffer, "forehead"
+
+    def _compute_bg_reference_signal(self, target_length: int):
+        """
+        Build a single-channel BG reference for NLMS by averaging the four
+        face-adjacent patch buffers frame-by-frame.
+
+        Returns a numpy array of length `target_length` aligned to the END of
+        the patch buffers (so the reference matches the same frames the
+        primary POS signal covers). Returns None if no patches have been
+        sampled this burst.
+        """
+        if not self._bg_patch_buffers:
+            return None
+        # Find common length across all patches (some may have skipped frames
+        # if the face moved enough that a patch fell outside the frame).
+        common = min(len(buf) for buf in self._bg_patch_buffers.values())
+        if common == 0:
+            return None
+        # Stack the last `common` samples from each patch and average per-frame.
+        stacked = np.array(
+            [list(buf)[-common:] for buf in self._bg_patch_buffers.values()],
+            dtype=np.float64,
+        )
+        avg = stacked.mean(axis=0)
+        # Align to the primary signal length — pad with the mean if BG buffer
+        # is shorter than POS buffer, or trim if longer.
+        if len(avg) == target_length:
+            return avg
+        if len(avg) > target_length:
+            return avg[-target_length:]
+        # Pad with the BG mean at the front so the early-burst portion that
+        # had no BG samples doesn't introduce a sudden jump
+        pad = np.full(target_length - len(avg), avg.mean(), dtype=np.float64)
+        return np.concatenate([pad, avg])
+
+    def _is_ambient_aliasing_active(self, bg_reference) -> bool:
+        """
+        Detect whether ambient flicker (fluorescent lights, screen glow) is
+        producing a dominant peak in the heart-rate band of the BACKGROUND
+        signal itself. When True, rPPG cannot be trusted for this burst —
+        the BG isn't a clean reference any more, it's leaking pulse-band noise
+        into the same band we measure for heart rate.
+
+        Computed as: bandpass-filter the BG average, FFT, take peak power
+        relative to total band power. If the peak holds more than
+        SIGNAL_DEMOTION_BG_PEAK_RATIO of the band energy, the BG is dominated
+        by a single aliased frequency → demote rPPG.
+        """
+        if bg_reference is None or len(bg_reference) < 16:
+            return False
+        bg_filtered = self._bandpass_filter(bg_reference)
+        peak_freq, peak_power, total_power = self._spectral_peak_freq_and_power(
+            bg_filtered, config.RPPG_SAMPLE_RATE
+        )
+        if peak_freq is None or total_power < 1e-6:
+            return False
+        peak_ratio = peak_power / total_power
+        triggered  = peak_ratio >= config.SIGNAL_DEMOTION_BG_PEAK_RATIO
+        if triggered:
+            logger.debug(
+                f"Ambient aliasing detected: BG peak at {peak_freq:.3f} Hz "
+                f"holds {peak_ratio:.2f} of band energy "
+                f"(threshold {config.SIGNAL_DEMOTION_BG_PEAK_RATIO:.2f})"
+            )
+        return triggered
 
     def _bandpass_filter(self, signal_array):
         """
@@ -577,59 +828,54 @@ class RPPGDetector:
 
     # ── Private helpers ───────────────────────────────────────────────────
 
-    def _extract_green_mean(self, frame, landmarks):
+    def _extract_rgb_means_forehead(self, frame, landmarks):
         """
-        Extract mean green channel intensity from the forehead ROI.
+        Extract (R, G, B) channel means from the forehead ROI for POS.
 
-        Uses FOREHEAD_LANDMARKS from config to define a polygon over the
-        forehead skin region. Crops that region and returns mean of the
-        green channel (index 1 in BGR).
+        Uses FOREHEAD_LANDMARKS from config to define a polygon, masks
+        the frame, and averages each BGR channel over the masked pixels.
 
         Returns:
-            float mean green value, or None if extraction fails
+            (r, g, b) tuple of floats, or None if extraction fails.
         """
         try:
             import cv2
             h, w = frame.shape[:2]
 
-            # Build polygon from landmark coordinates
             pts = np.array(
                 [landmarks[i] for i in config.FOREHEAD_LANDMARKS],
                 dtype=np.int32
             )
 
-            # Create mask for the forehead polygon
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(mask, [pts], 255)
 
-            # Extract green channel mean within the mask
-            green_channel = frame[:, :, 1].astype(np.float64)
-            masked_pixels = green_channel[mask == 255]
-
-            if len(masked_pixels) == 0:
+            mask_idx = mask == 255
+            if not np.any(mask_idx):
                 logger.warning("Forehead ROI mask produced no pixels.")
                 return None
 
-            return float(np.mean(masked_pixels))
+            # frame is BGR; index 0 = B, 1 = G, 2 = R
+            b = float(np.mean(frame[:, :, 0][mask_idx].astype(np.float64)))
+            g = float(np.mean(frame[:, :, 1][mask_idx].astype(np.float64)))
+            r = float(np.mean(frame[:, :, 2][mask_idx].astype(np.float64)))
+            return (r, g, b)
 
         except (IndexError, cv2.error) as e:
-            logger.warning(f"Green channel extraction failed: {e}")
+            logger.warning(f"Forehead RGB extraction failed: {e}")
             return None
 
-    def _extract_cheek_green_mean(self, frame, landmarks):
+    def _extract_rgb_means_cheek(self, frame, landmarks):
         """
-        Fallback ROI: average green channel across CHEEK_ROI_SIZE_PX-sized
-        square patches around the left and right cheek landmarks.
+        Fallback ROI: (R, G, B) means averaged across both cheek patches.
 
-        Used when the forehead is occluded (cap, hair, hand). The cheek is
-        well-vascularised skin that doesn't typically share the forehead's
-        occlusion sources. We average both cheeks together to maximise
-        pixel count (≈3200 pixels combined at 40 px patch size) and to
-        cancel head-side-asymmetric illumination noise.
+        Used when the forehead is occluded (cap, hair, hand). Cheeks are
+        well-vascularised skin that don't typically share forehead occlusion
+        sources. We pool pixels from both cheeks before averaging to maximise
+        SNR (≈3200 pixels at 40 px patch size).
 
         Returns:
-            float mean green value across both cheek patches,
-            or None if both patches fall outside the frame.
+            (r, g, b) tuple of floats, or None if both patches fall outside.
         """
         try:
             import cv2  # noqa: F401
@@ -640,7 +886,8 @@ class RPPGDetector:
             h, w = frame.shape[:2]
             half = config.CHEEK_ROI_SIZE_PX // 2
 
-            pools = []
+            # Collect each channel's pixels across both cheeks, then average.
+            pools_b, pools_g, pools_r = [], [], []
             for landmark_idx in (config.LEFT_CHEEK_LANDMARK,
                                  config.RIGHT_CHEEK_LANDMARK):
                 try:
@@ -652,18 +899,24 @@ class RPPGDetector:
                 x2 = min(w, int(cx) + half)
                 y2 = min(h, int(cy) + half)
                 if x2 <= x1 or y2 <= y1:
-                    continue  # cheek patch fell entirely outside frame
-                patch = frame[y1:y2, x1:x2, 1]  # green channel
+                    continue
+                patch = frame[y1:y2, x1:x2]
                 if patch.size == 0:
                     continue
-                pools.append(patch.astype(np.float64).flatten())
+                pools_b.append(patch[:, :, 0].astype(np.float64).flatten())
+                pools_g.append(patch[:, :, 1].astype(np.float64).flatten())
+                pools_r.append(patch[:, :, 2].astype(np.float64).flatten())
 
-            if not pools:
+            if not pools_b:
                 return None
-            return float(np.mean(np.concatenate(pools)))
+
+            b = float(np.mean(np.concatenate(pools_b)))
+            g = float(np.mean(np.concatenate(pools_g)))
+            r = float(np.mean(np.concatenate(pools_r)))
+            return (r, g, b)
 
         except Exception as e:
-            logger.warning(f"Cheek green extraction failed: {e}")
+            logger.warning(f"Cheek RGB extraction failed: {e}")
             return None
 
     def _sample_bg_patches(self, frame, landmarks) -> dict:
@@ -752,6 +1005,7 @@ class RPPGDetector:
             "filtered_buffer":           getattr(self, "_last_filtered", []),
             "background_correlation":    self.compute_face_background_correlation(),   # legacy, diagnostic only
             "spectral_replay_suspected": self.is_spectral_replay_suspected(),          # Path C primary defence
+            "ambient_aliasing":          self._last_ambient_aliasing,                  # Day-N: signal-demotion flag
             "status":                    status,
             "active_roi":                self._active_roi,
         }

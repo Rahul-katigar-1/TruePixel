@@ -52,6 +52,18 @@ class StatusIndicator(tk.Frame):
     def set_initializing(self):
         self._label.config(text="● INITIALIZING", fg=config.AMBER_COLOR)
 
+    def set_no_face(self):
+        """
+        NO FACE state — user has stepped out of frame. NOT an alert; the
+        amber colour signals "inconclusive, waiting for face to return".
+        The countdown widget directly below the video shows the exact
+        seconds until the next attempt, so we don't duplicate it here.
+        """
+        self._label.config(
+            text="● NO FACE DETECTED — checking again soon",
+            fg=config.AMBER_COLOR,
+        )
+
 
 class MetricRow(tk.Frame):
     """
@@ -135,6 +147,7 @@ class FeedbackPanel(tk.Frame):
         super().__init__(parent, bg=config.PANEL_BG, **kwargs)
         self._on_label = on_label_callback
         self._pending_check = None  # check_number waiting to be labelled
+        self._queue_depth   = 0     # how many MORE checks are waiting in queue
 
         # Status line (which check is being labelled, what the system thought)
         self._status = tk.Label(
@@ -143,6 +156,16 @@ class FeedbackPanel(tk.Frame):
             justify=tk.LEFT, anchor="w",
         )
         self._status.pack(fill=tk.X, padx=8, pady=(4, 2))
+
+        # Queue badge — shows when one or more new checks have completed
+        # while the dev is still labelling the current one. Stays hidden
+        # (empty text) when queue is empty.
+        self._queue_badge = tk.Label(
+            self, text="", font=("Courier", 8, "bold"),
+            bg=config.PANEL_BG, fg=config.AMBER_COLOR,
+            justify=tk.LEFT, anchor="w",
+        )
+        self._queue_badge.pack(fill=tk.X, padx=8, pady=(0, 2))
 
         # Image preview — the burst frame the developer is about to label.
         # Black placeholder until set_pending_check delivers the first frame.
@@ -157,6 +180,14 @@ class FeedbackPanel(tk.Frame):
         btn_row = tk.Frame(self, bg=config.PANEL_BG)
         btn_row.pack(fill=tk.X, padx=6, pady=(0, 6))
 
+        # All three buttons use takefocus=0 so they cannot receive keyboard
+        # focus, and we explicitly unbind Space/Return on them. Without this,
+        # a button that retained focus from a previous click would re-fire if
+        # the developer pressed Space or Enter while doing something else
+        # (typing into the event log, scrolling, switching windows). We saw
+        # this in the wild — 3 burst frames containing a friend got
+        # accidentally labelled "real" because the Real button had stale
+        # focus when the dev pressed Enter for an unrelated reason.
         self._real_btn = tk.Button(
             btn_row, text="✓ Real",
             font=("Courier", 9, "bold"),
@@ -164,6 +195,7 @@ class FeedbackPanel(tk.Frame):
             activebackground="#1c5238", activeforeground=config.VERIFIED_COLOR,
             relief=tk.FLAT, padx=8, pady=4,
             state=tk.DISABLED,
+            takefocus=0,
             command=lambda: self._click("real"),
         )
         self._real_btn.pack(side=tk.LEFT, padx=(0, 4), expand=True, fill=tk.X)
@@ -175,6 +207,7 @@ class FeedbackPanel(tk.Frame):
             activebackground="#521c1c", activeforeground=config.ALERT_COLOR,
             relief=tk.FLAT, padx=8, pady=4,
             state=tk.DISABLED,
+            takefocus=0,
             command=lambda: self._click("fake"),
         )
         self._fake_btn.pack(side=tk.LEFT, padx=(0, 4), expand=True, fill=tk.X)
@@ -186,19 +219,53 @@ class FeedbackPanel(tk.Frame):
             activebackground="#3a3a4a", activeforeground=config.TEXT_COLOR,
             relief=tk.FLAT, padx=8, pady=4,
             state=tk.DISABLED,
+            takefocus=0,
             command=lambda: self._click("ignore"),
         )
         self._ignore_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        # Explicitly remove the Space/Return key bindings on each button so
+        # they can ONLY be activated by a mouse click. Belt-and-braces beside
+        # takefocus=0 — if anything else gives them focus programmatically,
+        # the keys still won't fire the command.
+        for btn in (self._real_btn, self._fake_btn, self._ignore_btn):
+            btn.unbind("<Key-space>")
+            btn.unbind("<Key-Return>")
+            btn.bind("<Key-space>",  lambda e: "break")
+            btn.bind("<Key-Return>", lambda e: "break")
 
     def set_pending_check(self, check_number, frame=None, passed=None):
         """
         Called by Dashboard after each new check completes.
         Args:
             check_number: id of the check to label
-            frame: numpy BGR frame from the burst (or None)
+            frame: numpy BGR frame from the burst, or None for NO_FACE checks
             passed: bool — what the system decided (for status line context)
+
+        Behaviour:
+          - frame is None  → clear the image, disable all 3 buttons,
+                              show "no face — nothing to label" status.
+                              There's nothing meaningful to label as Real
+                              or Fake when the camera saw no face.
+          - frame provided → render preview + enable Real/Fake/Ignore.
         """
         self._pending_check = check_number
+
+        # NO_FACE check — nothing to label. Clear the stale image so the
+        # operator doesn't see an old frame and assume the system is still
+        # tracking them, and disable the buttons so no label can be logged.
+        if frame is None:
+            self._image_label.config(image="")
+            self._image_ref = None
+            self._status.config(
+                text=f"Check #{check_number}: no face — nothing to label",
+                fg=config.TEXT_COLOR,
+            )
+            self._real_btn.config(state=tk.DISABLED)
+            self._fake_btn.config(state=tk.DISABLED)
+            self._ignore_btn.config(state=tk.DISABLED)
+            self._pending_check = None
+            return
 
         verdict = ""
         if passed is True:
@@ -211,23 +278,40 @@ class FeedbackPanel(tk.Frame):
         )
 
         # Render the preview thumbnail — convert BGR → RGB → PIL → PhotoImage.
-        if frame is not None:
-            try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(rgb).resize(
-                    (FEEDBACK_THUMB_WIDTH, FEEDBACK_THUMB_HEIGHT)
-                )
-                self._image_ref = ImageTk.PhotoImage(img)
-                self._image_label.config(image=self._image_ref)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"FeedbackPanel preview render failed: {e}"
-                )
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb).resize(
+                (FEEDBACK_THUMB_WIDTH, FEEDBACK_THUMB_HEIGHT)
+            )
+            self._image_ref = ImageTk.PhotoImage(img)
+            self._image_label.config(image=self._image_ref)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"FeedbackPanel preview render failed: {e}"
+            )
 
         self._real_btn.config(state=tk.NORMAL)
         self._fake_btn.config(state=tk.NORMAL)
         self._ignore_btn.config(state=tk.NORMAL)
+
+    def set_queue_depth(self, depth: int):
+        """
+        Show how many additional checks are queued behind the one currently
+        displayed. The Dashboard pushes this whenever the queue changes so
+        the developer can see when they're falling behind.
+
+          depth == 0 → no badge (idle / just one check on screen)
+          depth >= 1 → "⏳ N more queued — label this to advance"
+        """
+        self._queue_depth = int(depth)
+        if self._queue_depth <= 0:
+            self._queue_badge.config(text="")
+        else:
+            self._queue_badge.config(
+                text=f"⏳ {self._queue_depth} more queued — label this to advance",
+                fg=config.AMBER_COLOR,
+            )
 
     def _click(self, label):
         """Internal: handle a button press and disable until next check."""
@@ -286,9 +370,9 @@ class RPPGGraphPanel(tk.Frame):
 
         # Common styling for all three axes
         for ax, title, ylabel, line_color in [
-            (self._ax_raw,      "Raw green channel — forehead ROI mean", "Green intensity", "#06b6d4"),
-            (self._ax_filtered, "Bandpass filtered (0.75-2.5 Hz)",       "Amplitude",       "#10b981"),
-            (self._ax_bpm,      "Estimated heart rate over checks",      "BPM",             "#f59e0b"),
+            (self._ax_raw,      "POS-projected rPPG signal — active ROI",  "POS amplitude",  "#06b6d4"),
+            (self._ax_filtered, "Bandpass filtered (0.75-2.5 Hz)",          "Amplitude",      "#10b981"),
+            (self._ax_bpm,      "Estimated heart rate over checks",         "BPM",            "#f59e0b"),
         ]:
             ax.set_title(title, fontsize=8, color=config.TEXT_COLOR, pad=2)
             ax.set_ylabel(ylabel, fontsize=7, color=config.TEXT_COLOR)
