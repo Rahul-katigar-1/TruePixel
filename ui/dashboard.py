@@ -456,6 +456,8 @@ class Dashboard:
             "lbp_variance",
             "texture_screen_suspected",
             "background_correlation",
+            "face_sharpness",
+            "face_brightness",
             "alert_reason",
             "image_path",
         ]
@@ -480,6 +482,8 @@ class Dashboard:
             f"{result.lbp_variance:.6f}",
             result.texture_screen_suspected,
             f"{result.background_correlation:.4f}",
+            f"{result.face_sharpness:.4f}",
+            f"{result.face_brightness:.4f}",
             (result.alert_reason or "").replace(",", ";"),
             image_path,
         ]

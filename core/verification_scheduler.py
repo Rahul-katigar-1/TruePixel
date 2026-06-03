@@ -26,6 +26,7 @@ from typing import Callable, Optional, List, Any
 
 import config
 from core.texture_detector import TextureDetector
+from core.face_quality import compute_face_sharpness, compute_face_brightness
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,12 @@ class CheckResult:
     lbp_variance:           float = 0.0
     texture_screen_suspected: bool = False
     alert_reason:           Optional[str] = None
+    # ── Face quality diagnostics (read-only, do NOT drive verdict) ──────
+    # Logged per check so we can correlate face_confidence drops with
+    # frame conditions (blur, backlight) instead of always blaming the
+    # face matcher. See core/face_quality.py for the metric definitions.
+    face_sharpness:         float = 0.0   # 0.0-1.0, Laplacian variance / 200
+    face_brightness:        float = 0.0   # 0.0-1.0, mean grey / 255
     # ── Face presence (MediaPipe authoritative) ─────────────────────────
     # face_present=False means MediaPipe didn't detect a face in enough of
     # the burst frames — user stepped away, glanced down, etc. This is a
@@ -454,6 +461,12 @@ class VerificationScheduler:
         lbp_variance           = texture_result["lbp_variance"]
         texture_screen_suspected = texture_result["is_screen_suspected"]
 
+        # Face-quality diagnostics. Don't drive the verdict — purely logged
+        # so future analysis can correlate face_confidence drops with frame
+        # conditions (blur, backlight). Both are <1 ms each on 640×480.
+        face_sharpness  = compute_face_sharpness(last_frame, last_landmarks)
+        face_brightness = compute_face_brightness(last_frame, last_landmarks)
+
         # Clamp rPPG contribution at noise floor — zero credit below floor
         rppg_contribution = max(0.0, final_signal_quality - config.RPPG_NOISE_FLOOR)
 
@@ -538,6 +551,8 @@ class VerificationScheduler:
             alert_reason             = alert_reason,
             face_present             = True,
             face_present_ratio       = face_present_ratio,
+            face_sharpness           = face_sharpness,
+            face_brightness          = face_brightness,
             last_frame               = last_frame,
         )
 

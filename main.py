@@ -131,6 +131,8 @@ def main():
             f"score={result.composite_score:.2f} | "
             f"frames={result.frames_captured} | "
             f"lbp={result.lbp_variance:.5f} | "
+            f"sharp={result.face_sharpness:.2f} | "
+            f"bright={result.face_brightness:.2f} | "
             f"bg-corr={result.background_correlation:.3f} {gate_str}"
         )
         dashboard.log.add_entry(summary_line)
