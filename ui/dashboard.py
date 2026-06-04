@@ -458,6 +458,9 @@ class Dashboard:
             "background_correlation",
             "face_sharpness",
             "face_brightness",
+            "gaze_x",
+            "gaze_y",
+            "gaze_drift",
             "alert_reason",
             "image_path",
         ]
@@ -484,6 +487,9 @@ class Dashboard:
             f"{result.background_correlation:.4f}",
             f"{result.face_sharpness:.4f}",
             f"{result.face_brightness:.4f}",
+            f"{result.gaze_x:+.4f}",
+            f"{result.gaze_y:+.4f}",
+            f"{result.gaze_drift:.4f}",
             (result.alert_reason or "").replace(",", ";"),
             image_path,
         ]

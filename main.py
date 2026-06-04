@@ -133,6 +133,8 @@ def main():
             f"lbp={result.lbp_variance:.5f} | "
             f"sharp={result.face_sharpness:.2f} | "
             f"bright={result.face_brightness:.2f} | "
+            f"gaze=({result.gaze_x:+.2f},{result.gaze_y:+.2f}) | "
+            f"gaze-drift={result.gaze_drift:.3f} | "
             f"bg-corr={result.background_correlation:.3f} {gate_str}"
         )
         dashboard.log.add_entry(summary_line)

@@ -42,6 +42,7 @@ MOUTH_RIGHT_CORNER      = 291
 
 # Iris and head landmarks
 IRIS_LEFT_CENTER  = 468   # left iris center (requires refine_landmarks=True)
+IRIS_RIGHT_CENTER = 473   # right iris center (used by gaze_detector for gaze direction)
 NOSE_TIP_LANDMARK = 1
 
 # ── LBP texture defence (Improvement 2 / Layer 2 replay) ─────────────────────
