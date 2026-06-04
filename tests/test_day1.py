@@ -715,6 +715,199 @@ def test_face_matcher_rejects_dim_mismatch_silently():
     assert result["name"] == "Unknown"
 
 
+def test_face_sharpness_returns_zero_on_none_inputs():
+    """Both None frame and None landmarks must return 0.0 safely."""
+    from core.face_quality import compute_face_sharpness
+    assert compute_face_sharpness(None, None) == 0.0
+    assert compute_face_sharpness(np.zeros((100, 100, 3), dtype=np.uint8), None) == 0.0
+    assert compute_face_sharpness(None, [(10, 10)] * 478) == 0.0
+
+
+def test_face_sharpness_higher_on_sharp_image_than_blurry():
+    """
+    Synthetic sharp image (chequerboard of high-frequency edges) must score
+    strictly higher than a synthetic blurry image (uniform grey). Validates
+    the Laplacian-variance method.
+    """
+    from core.face_quality import compute_face_sharpness
+    import config
+
+    # Build landmarks that map FOREHEAD_LANDMARKS to a 100x100 box in the centre.
+    fake_landmarks = [(320, 240)] * 478  # filler
+    for idx in config.FOREHEAD_LANDMARKS:
+        fake_landmarks[idx] = (320, 240)
+    # Then overwrite forehead landmark indices with corners of a 150x150 box.
+    forehead = config.FOREHEAD_LANDMARKS
+    box_xs = np.linspace(245, 395, num=len(forehead), dtype=int)
+    box_ys = np.linspace(165, 315, num=len(forehead), dtype=int)
+    for i, idx in enumerate(forehead):
+        fake_landmarks[idx] = (int(box_xs[i]), int(box_ys[i]))
+
+    # Sharp: random high-frequency noise (high Laplacian variance)
+    rng         = np.random.default_rng(seed=1)
+    sharp_frame = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
+
+    # Blurry: uniform mid-grey (Laplacian variance = 0)
+    blurry_frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+
+    sharp_score  = compute_face_sharpness(sharp_frame,  fake_landmarks)
+    blurry_score = compute_face_sharpness(blurry_frame, fake_landmarks)
+
+    assert sharp_score > blurry_score, (
+        f"Sharp image should score higher than blurry. "
+        f"sharp={sharp_score:.3f}, blurry={blurry_score:.3f}"
+    )
+    assert blurry_score < 0.05, (
+        f"Uniform grey should be near-zero sharpness, got {blurry_score:.3f}"
+    )
+
+
+def test_face_brightness_returns_zero_on_none_inputs():
+    """Both None frame and None landmarks must return 0.0 safely."""
+    from core.face_quality import compute_face_brightness
+    assert compute_face_brightness(None, None) == 0.0
+    assert compute_face_brightness(np.zeros((100, 100, 3), dtype=np.uint8), None) == 0.0
+
+
+def test_face_brightness_proportional_to_pixel_intensity():
+    """
+    Pure black face region → near 0.0. Pure white → near 1.0. Mid-grey → ~0.5.
+    Validates the mean-intensity normalisation.
+    """
+    from core.face_quality import compute_face_brightness
+    import config
+
+    # Set up forehead landmarks at a small known region.
+    fake_landmarks = [(320, 240)] * 478
+    forehead = config.FOREHEAD_LANDMARKS
+    box_xs = np.linspace(245, 395, num=len(forehead), dtype=int)
+    box_ys = np.linspace(165, 315, num=len(forehead), dtype=int)
+    for i, idx in enumerate(forehead):
+        fake_landmarks[idx] = (int(box_xs[i]), int(box_ys[i]))
+
+    black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    grey_frame  = np.full((480, 640, 3), 128, dtype=np.uint8)
+    white_frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+
+    assert compute_face_brightness(black_frame, fake_landmarks) < 0.05
+    grey  = compute_face_brightness(grey_frame,  fake_landmarks)
+    assert 0.45 < grey < 0.55, f"Mid-grey should be ~0.5, got {grey:.3f}"
+    assert compute_face_brightness(white_frame, fake_landmarks) > 0.95
+
+
+def test_gaze_compute_returns_zeros_on_none_landmarks():
+    """None landmarks must return (0.0, 0.0) safely — used as the no-op
+    contribution to per-frame gaze aggregation."""
+    from core.gaze_detector import compute_gaze
+    result = compute_gaze(None)
+    assert result == (0.0, 0.0)
+
+
+def test_gaze_compute_centered_iris_returns_near_zero():
+    """
+    Synthetic landmarks: iris centred in a 20×10 eye box. Resulting gaze
+    must be very close to (0, 0). Validates the eye-centre arithmetic.
+    """
+    from core.gaze_detector import compute_gaze
+    import config
+
+    # 478 placeholder points; we only overwrite the eye + iris indices.
+    landmarks = [(0, 0)] * 478
+
+    # Build a synthetic LEFT eye: 6 corners forming a rectangle 20 wide × 10 tall,
+    # centred at (100, 100). Same for the RIGHT eye centred at (200, 100).
+    def rect_corners(cx, cy, half_w, half_h):
+        return [
+            (cx - half_w, cy),       # left corner
+            (cx - half_w // 2, cy - half_h),
+            (cx + half_w // 2, cy - half_h),
+            (cx + half_w, cy),       # right corner
+            (cx + half_w // 2, cy + half_h),
+            (cx - half_w // 2, cy + half_h),
+        ]
+
+    for idx, pt in zip(config.LEFT_EYE_INDICES,  rect_corners(100, 100, 10, 5)):
+        landmarks[idx] = pt
+    for idx, pt in zip(config.RIGHT_EYE_INDICES, rect_corners(200, 100, 10, 5)):
+        landmarks[idx] = pt
+
+    # Iris centres exactly at eye centres
+    landmarks[config.IRIS_LEFT_CENTER]  = (100, 100)
+    landmarks[config.IRIS_RIGHT_CENTER] = (200, 100)
+
+    gx, gy = compute_gaze(landmarks)
+    assert abs(gx) < 0.05, f"Centred iris should give gaze_x ~ 0, got {gx:.3f}"
+    assert abs(gy) < 0.05, f"Centred iris should give gaze_y ~ 0, got {gy:.3f}"
+
+
+def test_gaze_compute_off_center_iris_returns_nonzero_x():
+    """
+    Iris shifted RIGHT within each eye (image coordinates) → gaze_x > 0,
+    by the sign convention documented in compute_gaze.
+    """
+    from core.gaze_detector import compute_gaze
+    import config
+
+    landmarks = [(0, 0)] * 478
+
+    def rect_corners(cx, cy, half_w, half_h):
+        return [
+            (cx - half_w, cy),
+            (cx - half_w // 2, cy - half_h),
+            (cx + half_w // 2, cy - half_h),
+            (cx + half_w, cy),
+            (cx + half_w // 2, cy + half_h),
+            (cx - half_w // 2, cy + half_h),
+        ]
+
+    for idx, pt in zip(config.LEFT_EYE_INDICES,  rect_corners(100, 100, 10, 5)):
+        landmarks[idx] = pt
+    for idx, pt in zip(config.RIGHT_EYE_INDICES, rect_corners(200, 100, 10, 5)):
+        landmarks[idx] = pt
+
+    # Push both irises 6 px to the right of their eye centres (≈ 0.6 normalised)
+    landmarks[config.IRIS_LEFT_CENTER]  = (106, 100)
+    landmarks[config.IRIS_RIGHT_CENTER] = (206, 100)
+
+    gx, gy = compute_gaze(landmarks)
+    assert gx > 0.3, (
+        f"Iris pushed +6 px in a +/-10 half-width eye should give gaze_x ~ 0.6, "
+        f"got {gx:.3f}"
+    )
+    assert abs(gy) < 0.05, f"Vertical gaze should still be 0, got {gy:.3f}"
+
+
+def test_gaze_aggregate_drift_zero_for_static_gaze():
+    """
+    Identical gaze samples → drift = 0 (the static-photo case). Validates
+    the std-dev reduction.
+    """
+    from core.gaze_detector import aggregate_gaze
+    samples = [(0.2, -0.1)] * 30
+    stats = aggregate_gaze(samples)
+    assert abs(stats["mean_x"] - 0.2)  < 1e-9
+    assert abs(stats["mean_y"] - (-0.1)) < 1e-9
+    assert stats["drift"] < 1e-9, (
+        f"Identical samples must give drift = 0, got {stats['drift']:.6f}"
+    )
+
+
+def test_gaze_aggregate_drift_nonzero_for_moving_gaze():
+    """
+    Samples covering a swept range → drift > 0 (a real human looking
+    around during the burst).
+    """
+    from core.gaze_detector import aggregate_gaze
+    samples = [(x, 0.0) for x in np.linspace(-0.5, 0.5, 30)]
+    stats = aggregate_gaze(samples)
+    # Mean of linspace(-0.5, 0.5) is 0
+    assert abs(stats["mean_x"]) < 0.05
+    # std of linspace(-0.5, 0.5) ≈ 0.295 → drift sqrt(var+0) ≈ 0.295
+    assert stats["drift"] > 0.2, (
+        f"Swept gaze should give meaningful drift, got {stats['drift']:.3f}"
+    )
+
+
 def test_face_present_default_is_true_for_normal_check():
     """
     A CheckResult constructed without explicitly setting face_present must
@@ -1261,6 +1454,15 @@ check("NO_FACE short_failure_reason takes priority",       test_no_face_short_fa
 check("_face_present_now returns True with landmarks",     test_face_present_now_returns_true_when_landmarks_present)
 check("_face_present_now returns False without landmarks", test_face_present_now_returns_false_when_no_landmarks)
 check("face_present defaults True for normal checks",      test_face_present_default_is_true_for_normal_check)
+check("Face sharpness returns 0 on None inputs",           test_face_sharpness_returns_zero_on_none_inputs)
+check("Face sharpness higher on sharp vs blurry image",    test_face_sharpness_higher_on_sharp_image_than_blurry)
+check("Face brightness returns 0 on None inputs",          test_face_brightness_returns_zero_on_none_inputs)
+check("Face brightness proportional to pixel intensity",   test_face_brightness_proportional_to_pixel_intensity)
+check("Gaze returns (0,0) on None landmarks",              test_gaze_compute_returns_zeros_on_none_landmarks)
+check("Gaze returns ~0 when iris is centred in eye",       test_gaze_compute_centered_iris_returns_near_zero)
+check("Gaze returns positive x when iris shifted right",   test_gaze_compute_off_center_iris_returns_nonzero_x)
+check("Gaze drift = 0 for static-photo identical samples", test_gaze_aggregate_drift_zero_for_static_gaze)
+check("Gaze drift > 0 for swept moving gaze",              test_gaze_aggregate_drift_nonzero_for_moving_gaze)
 check("FaceMatcher: orthogonal embedding gives 0.0 (no inflation)", test_face_matcher_uses_raw_cosine_not_inflated)
 check("FaceMatcher: TOP-K-of-poses rejects one-pose lookalike", test_face_matcher_top_k_aggregation_rejects_one_pose_lookalike)
 check("FaceMatcher: genuine user across all 3 poses passes",  test_face_matcher_accepts_genuine_user_across_all_poses)

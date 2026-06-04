@@ -26,6 +26,8 @@ from typing import Callable, Optional, List, Any
 
 import config
 from core.texture_detector import TextureDetector
+from core.face_quality import compute_face_sharpness, compute_face_brightness
+from core.gaze_detector import compute_gaze, aggregate_gaze
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,20 @@ class CheckResult:
     lbp_variance:           float = 0.0
     texture_screen_suspected: bool = False
     alert_reason:           Optional[str] = None
+    # ── Face quality diagnostics (read-only, do NOT drive verdict) ──────
+    # Logged per check so we can correlate face_confidence drops with
+    # frame conditions (blur, backlight) instead of always blaming the
+    # face matcher. See core/face_quality.py for the metric definitions.
+    face_sharpness:         float = 0.0   # 0.0-1.0, Laplacian variance / 200
+    face_brightness:        float = 0.0   # 0.0-1.0, mean grey / 255
+    # ── Gaze diagnostics (read-only, do NOT drive verdict) ──────────────
+    # mean iris offset across burst + std-dev of iris movement. (0,0) gaze
+    # with low drift = looking at camera and not moving (could be a
+    # static photo OR a focused human). Captured so future analysis can
+    # decide whether to add gaze_drift as a 6th liveness signal.
+    gaze_x:                 float = 0.0   # mean horizontal gaze offset
+    gaze_y:                 float = 0.0   # mean vertical gaze offset
+    gaze_drift:             float = 0.0   # std-dev magnitude — eye movement
     # ── Face presence (MediaPipe authoritative) ─────────────────────────
     # face_present=False means MediaPipe didn't detect a face in enough of
     # the burst frames — user stepped away, glanced down, etc. This is a
@@ -299,6 +315,7 @@ class VerificationScheduler:
         last_landmarks         = None
         frames_with_face       = 0    # MediaPipe-authoritative face presence counter
         face_present_per_frame = []   # per-frame bool — used for the recent-window gate
+        gaze_samples           = []   # per-frame (gaze_x, gaze_y) when a face was present
 
         for i, frame in enumerate(frames):
             landmarks, _ = self.face_mesh.process(frame)
@@ -322,6 +339,12 @@ class VerificationScheduler:
                     match = self.face_matcher.match(frame)
                     face_confidences.append(match["confidence"])
                     face_matches.append((match["name"], match["confidence"]))
+
+                # Gaze sample — cheap (one tuple subtraction per eye), runs
+                # on every face-present frame so drift std-dev has enough
+                # data to be meaningful. Diagnostic only; does not gate the
+                # verdict.
+                gaze_samples.append(compute_gaze(landmarks))
 
             # Blink detection — run on every frame (the detector handles None
             # landmarks internally and contributes nothing to liveness signals
@@ -454,6 +477,17 @@ class VerificationScheduler:
         lbp_variance           = texture_result["lbp_variance"]
         texture_screen_suspected = texture_result["is_screen_suspected"]
 
+        # Face-quality diagnostics. Don't drive the verdict — purely logged
+        # so future analysis can correlate face_confidence drops with frame
+        # conditions (blur, backlight). Both are <1 ms each on 640×480.
+        face_sharpness  = compute_face_sharpness(last_frame, last_landmarks)
+        face_brightness = compute_face_brightness(last_frame, last_landmarks)
+
+        # Gaze aggregates — diagnostic only. mean_x / mean_y describe where
+        # the user was looking on average across the burst; drift is the
+        # std-dev of gaze samples (i.e. how much the eyes moved).
+        gaze_stats = aggregate_gaze(gaze_samples)
+
         # Clamp rPPG contribution at noise floor — zero credit below floor
         rppg_contribution = max(0.0, final_signal_quality - config.RPPG_NOISE_FLOOR)
 
@@ -538,6 +572,11 @@ class VerificationScheduler:
             alert_reason             = alert_reason,
             face_present             = True,
             face_present_ratio       = face_present_ratio,
+            face_sharpness           = face_sharpness,
+            face_brightness          = face_brightness,
+            gaze_x                   = gaze_stats["mean_x"],
+            gaze_y                   = gaze_stats["mean_y"],
+            gaze_drift               = gaze_stats["drift"],
             last_frame               = last_frame,
         )
 

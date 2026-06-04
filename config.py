@@ -42,6 +42,7 @@ MOUTH_RIGHT_CORNER      = 291
 
 # Iris and head landmarks
 IRIS_LEFT_CENTER  = 468   # left iris center (requires refine_landmarks=True)
+IRIS_RIGHT_CENTER = 473   # right iris center (used by gaze_detector for gaze direction)
 NOSE_TIP_LANDMARK = 1
 
 # ── LBP texture defence (Improvement 2 / Layer 2 replay) ─────────────────────
@@ -79,15 +80,20 @@ RIGHT_CHEEK_LANDMARK = 280
 CHEEK_ROI_SIZE_PX = 40
 
 # rPPG heartbeat detection
-# rPPG buffer matches burst duration exactly (8s at 15fps = 120 samples)
-# FFT resolution = 15/120 = 0.125 Hz = ±7.5 BPM accuracy at 60 BPM
-# Sufficient for liveness detection. Not a medical device.
-RPPG_BUFFER_SECONDS = 8
+# rPPG buffer matches burst duration exactly (4s at 15fps = 60 samples).
+# FFT resolution = 15/60 = 0.25 Hz = ±15 BPM accuracy at 60 BPM.
+# This is the looser resolution after the May 2026 speed-up (was 8s → ±7.5 BPM).
+# The BPM number on the dashboard is therefore noisier, but the value we
+# actually gate on (signal_quality > RPPG_NOISE_FLOOR ≈ 0.12) is still
+# determined from peak-power / total-power and works correctly at 4s.
+# Not a medical device — we only need "is there a heartbeat-shaped signal?"
+RPPG_BUFFER_SECONDS = 4
 RPPG_LOW_FREQ = 0.75
 RPPG_HIGH_FREQ = 2.5
 # rPPG sample rate matches BURST_FPS — these two must always be equal.
-# Buffer = RPPG_BUFFER_SECONDS × RPPG_SAMPLE_RATE = 8 × 15 = 120 samples.
-# Frequency resolution = 1/8s = 0.125 Hz = ±7.5 BPM. Acceptable for liveness detection.
+# Buffer = RPPG_BUFFER_SECONDS × RPPG_SAMPLE_RATE = 4 × 15 = 60 samples.
+# Frequency resolution = 1/4s = 0.25 Hz = ±15 BPM. Coarser than the
+# pre-May-2026 8s window but acceptable for liveness binary detection.
 # ROOT CAUSE NOTE: was 30 on Day 1 before burst mode existed. Fixed Day 3.
 # If you change BURST_FPS you must change this to match. They are coupled.
 RPPG_SAMPLE_RATE = 15
@@ -149,11 +155,16 @@ DEV_FEEDBACK_BUTTON = True
 DEV_FEEDBACK_CSV_PATH = "logs/dev_feedback.csv"
 
 # ── Verification Mode ─────────────────────────────────────────────────────────
-# TEST_MODE = True  → verifies every 10 seconds (use during development)
+# TEST_MODE = True  → near-continuous verification (use during development)
 # TEST_MODE = False → adaptive intervals 2m→5m→10m→15-20m (use for demo)
 # To go live: change TEST_MODE to False. That is the only change needed.
 TEST_MODE = True
-TEST_MODE_INTERVAL_SECONDS = 10
+# May 2026: shortened from 10s → 2s. Combined with the 4s burst below this
+# gives a ~6s end-to-end verification cycle (was ~18s). Phone-screen attacks
+# are now caught within ~6s worst-case (often <2s if the attack persists
+# into the next burst). The cost: face matcher fires ~3× more often, so
+# CPU usage during TEST_MODE is noticeably higher — but it's TEST_MODE only.
+TEST_MODE_INTERVAL_SECONDS = 2
 
 # Production adaptive intervals (used when TEST_MODE = False)
 INTERVAL_FIRST_CHECK_SECS  = 2  * 60   # 2 minutes
@@ -162,8 +173,14 @@ INTERVAL_PHASE_2_SECS      = 10 * 60   # 10 minutes
 INTERVAL_STEADY_STATE_MIN  = 15 * 60   # 15 minutes minimum
 INTERVAL_STEADY_STATE_MAX  = 20 * 60   # 20 minutes maximum
 
-# Burst capture settings (applies in both modes)
-BURST_DURATION_SECONDS     = 8
+# Burst capture settings (applies in both modes).
+# May 2026: shortened from 8s → 4s. rPPG FFT resolution drops from ±7.5 BPM
+# to ±15 BPM at 60 BPM, but the binary "is there a pulse?" gate
+# (signal_quality > RPPG_NOISE_FLOOR) still works at 4s. Liveness signals
+# (blink, EAR var, iris/head drift, mouth var) all stabilise well within
+# 4s. Face match + LBP are 1-frame so unaffected. Net effect: verdict
+# arrives 2× faster, with slightly less precise BPM display.
+BURST_DURATION_SECONDS     = 4
 BURST_FPS                  = 15
 
 # ── Composite scoring weights ─────────────────────────────────────────────────
